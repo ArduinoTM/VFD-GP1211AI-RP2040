@@ -1,0 +1,47 @@
+# ---- CMake / Pico SDK 构建产物 ----
+build/
+build-*/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+compile_commands.json
+.ninja_deps
+.ninja_log
+*.ninja
+
+# ---- 编译输出 ----
+*.o
+*.d
+*.a
+*.elf
+*.bin
+*.hex
+*.uf2
+*.map
+*.dis
+*.lst
+
+# ---- 宿主机测试 ----
+tests/build/
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+*.swp
+*~
+Thumbs.db
+desktop.ini
+
+# 本地工具链 / 依赖（不随仓库发布）
+.tools/
+node_modules/
+
+# 本机抓包与临时图（体积大、且属于本地测量数据）
+*.csv
+*.pgm
+
+# Python 缓存
+__pycache__/
+*.pyc

@@ -1,0 +1,91 @@
+name: Release
+
+# 打 v* 标签即自动构建并发布；也可以在 Actions 页面手动填标签触发
+on:
+  push:
+    tags: [ 'v*' ]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发布的标签（如 v1.0.0）'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  host-tests:
+    name: 宿主机测试
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 g++
+        run: sudo apt-get update && sudo apt-get install -y g++
+
+      - name: 运行宿主测试
+        shell: pwsh
+        run: ./tests/run_host_tests.ps1
+
+  build:
+    name: 固件构建（${{ matrix.engine }}）
+    needs: host-tests
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [ tick, pio ]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装工具链
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build pkg-config libusb-1.0-0-dev build-essential gcc-arm-none-eabi libnewlib-arm-none-eabi
+
+      - name: 获取 pico-sdk 2.1.0
+        run: |
+          git clone --depth 1 --branch 2.1.0 https://github.com/raspberrypi/pico-sdk.git "$RUNNER_TEMP/pico-sdk"
+          cd "$RUNNER_TEMP/pico-sdk" && git submodule update --init --depth 1
+
+      - name: 配置与编译（引擎 ${{ matrix.engine }}）
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DPICO_SDK_PATH="$RUNNER_TEMP/pico-sdk" \
+            -DPICO_BOARD=pico \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DVFD_SCAN_ENGINE=${{ matrix.engine }}
+          cmake --build build
+
+      - name: 收集 uf2
+        run: |
+          cp build/vfd_gp1211ai_demo.uf2 "vfd_gp1211ai_demo-${{ matrix.engine }}.uf2"
+          ls -l *.uf2
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: uf2-${{ matrix.engine }}
+          path: vfd_gp1211ai_demo-${{ matrix.engine }}.uf2
+          if-no-files-found: error
+
+  publish:
+    name: 发布 Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: 列出产物
+        run: ls -l artifacts
+
+      - name: 创建 / 更新 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          name: ${{ inputs.tag || github.ref_name }}
+          files: artifacts/*.uf2
+          generate_release_notes: true
+          draft: false

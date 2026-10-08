@@ -1,0 +1,56 @@
+;
+; ssd1306_spi_slave.pio —— 把 RP2040 模拟成一片 SSD1306（4 线 SPI 从机）
+;
+; 主机（任何 SSD1306 库）送出：SCLK / MOSI / CS / DC 四根线，SPI 模式 0（CPOL=0, CPHA=0）。
+; 本程序逐位采样 MOSI，并在每个字节的最后一位同时采样 DC，组成 9 位字推入 RX FIFO。
+;
+;   9 位字的真实布局（RP2040 数据手册 3.4.4 IN："IN 取源数据最低 N 位"，
+;   且"输入数据的位顺序与移位方向无关" ⇒ 2 位组里**低位引脚在低位**）：
+;
+;       bit:  8   7   6   5   4   3   2   1   0
+;             b7  b6  b5  b4  b3  b2  b1  DC  b0
+;
+;   即 word = ((byte >> 1) << 2) | (dc << 1) | (byte & 1)；
+;   由 ssd1306_pio_wire.h 的 unpackRxWord() 解码（宿主机有逐位模型测试）。
+;
+; 实现要点：
+;   · 所有 wait 必须用 `wait gpio`（**绝对**引脚号）。
+;     `wait pin N` 等的是 GPIO (PINCTRL.IN_BASE + N) mod 32 —— pico-sdk 原文
+;     "relative to the executing SM's input pin mapping"。本程序 IN_BASE = MOSI(GP12)，
+;     用 `wait pin 1` 会去等 GP13(=DC，命令期间恒低) ⇒ 状态机永远卡在第 2 条指令、
+;     一个字节都收不到（2026-10-06 现场故障的根因，见 docs/09）。
+;   · in_base = MOSI，DC 必须接在 MOSI+1（`in pins, 2` 一次采这两位）
+;   · jmp_pin = CS：每字节结束后检查，CS 抬高即认为一次事务结束；
+;     事务中途被抬高（残包）会跳到 txn_end 清掉 ISR，保证下一次事务位对齐
+;   · 全程不需要 CPU 参与，RX FIFO 由 DMA 搬到环形缓冲（见 ssd1306_slave_rp2040.cpp）
+;   · 程序只用 15 条指令（含诊断用 irq set 0），任何 PIO 块都能装下
+;
+; 引脚号说明：下面 `wait ... gpio 0/1` 里的 0 与 1 是**占位值**，
+;             运行时会按实际 CS / SCLK 引脚改写并在装载后自检（见 patchProgramPins()）。
+
+.program ssd1306_spi_slave
+
+.wrap_target
+wait_cs:
+    wait 0 gpio 0                   ; 等 CS 拉低（一次事务开始）
+byte_loop:
+    set x, 6                        ; 先收 7 位
+bit_loop:
+    wait 1 gpio 1                   ; SCLK 上升沿（模式 0：此刻数据已稳定）
+    in pins, 1                      ; 采 MOSI
+    wait 0 gpio 1                   ; 等 SCLK 回落
+    jmp pin, txn_end                ; CS 被抬高 → 事务中途结束，丢弃残片
+    jmp x-- bit_loop
+
+    wait 1 gpio 1                   ; 第 8 位
+    in pins, 2                      ; 同时采 {MOSI, DC}：bit0=MOSI 第 8 位，bit1=DC
+    wait 0 gpio 1
+    push                            ; 9 位入 FIFO（PUSH 会清空 ISR，故每个字的低位 9 位就是本字节）
+    irq set 0                       ; 【诊断】每成功推送一个字就置位 IRQ0：
+                                    ; CPU 轮询该标志并计数 ⇒ 硬件级"到底有没有走到 push"
+    jmp pin, txn_end                ; CS 抬高 → 一次事务结束
+    jmp byte_loop
+
+txn_end:
+    mov isr, null                   ; 清掉半字节残片，保证下次事务位对齐
+.wrap

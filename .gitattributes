@@ -1,0 +1,15 @@
+# 统一换行符：源码一律 LF（与 Pico SDK / git 默认行为冲突时以本文件为准）
+* text=auto eol=lf
+
+# Windows 脚本保留 CRLF，避免老版本 PowerShell 解析问题
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+
+# 二进制/生成物
+*.uf2 binary
+*.elf binary
+*.bin binary
+*.hex binary
+*.pdf binary
+*.jpg binary
+*.png binary

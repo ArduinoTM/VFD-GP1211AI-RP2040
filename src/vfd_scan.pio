@@ -1,0 +1,68 @@
+;
+; vfd_scan.pio —— GP1211AI 128x64 VFD 的 PIO 扫描引擎（可选）
+;
+; 每个扫描周期：wait（等 PWM wrap）→ 边界四步（CLKg 拉低 → 前进 → LAT 锁存 → 释放）
+;               → 把本扫描的 384 bit 阳极数据移出去。
+;
+; ⚠️ 边界四步（2026-10-08 依据 MN12864K 数据手册 + 实机抓包定稿）：
+;   手册 Figure 3/5 的硬要求：**LAT 空闲低（锁存打正脉冲）**、**CLKg 空闲高（脉冲低→高，
+;   上升沿 = 栅极链前进）**；顺序上必须"**先前进、再锁存**"，否则锁到的栅极对是"前进之前"
+;   的（本板 LATa 与 LATg 并联，手册 Note 15 要求 LATg 常高/透明）⇒ 画面恒定平移 3 像素
+;   （实测抓包：LAT 上升沿曾比 CLKg 前进沿早 440 ns）。
+;   四条 set pins 都带 [3] = 4 个 SM 周期 = 444 ns ≥ 手册 tWL 300 ns。
+;
+; ⚠️ 播种（SIg = 1,1,0,0,0 的 5 个 CLKg 脉冲）**不在本程序里**：
+;   它由 CPU 在帧末的 DMA 完成中断里直接翻 PIO 的引脚电平完成（见
+;   Rp2040Platform::seedGrid()，与 tick 引擎同一套写法）。理由：把播种块从 32 条指令里挪走
+;   才能同时容下"4 条边界 + 两层老循环"，避免再引入"按字读取 OSR"这类隐蔽陷阱。
+;   播种必须落在"上一次扫描的边界之后、帧首扫描的边界之前"——DMA 完成中断正好在那段窗口内
+;   （见 src/vfd_pio_seed_timing.h 的时序推导）。
+;
+; 引脚映射（由 vfd_platform_rp2040_pio.cpp 配置）：
+;   sideset 1（可选）: CLKa  —— 阳极移位时钟，空闲高（Note 7①）
+;   out      1       : SIa   —— 阳极串行数据（OSR 右移 + autopull 32bit → LSB first）
+;   set      3       : LAT, CLKg, SIg（必须是连续的三个引脚）
+;
+; set 组内的值（相对引脚基址）：bit0 = LAT，bit1 = CLKg，bit2 = SIg
+;   0x0 = 全低   0x1 = LAT 高   0x2 = CLKg 高   0x3 = LAT+CLKg 高
+;
+; 时序（SM 时钟 = 2 × CLKa；默认 CLKa = 4.5 MHz → SM 9 MHz，1 周期 ≈ 111 ns）：
+;   每个数据位 2 周期：out(side 0) 输出数据并拉低 CLKa → nop(side 1) 上升沿采样
+;   每个扫描 ≈ 802 周期 ≈ 89 µs（远小于 189 µs 周期与 119 µs 消隐窗口）。
+
+.program vfd_scan
+.side_set 1 opt
+
+.wrap_target
+scan:
+    wait 0 pin 7                        ; 等点亮窗口结束（BK 变低）
+    wait 1 pin 7                        ; 等消隐窗口开始（BK 变高 = PWM wrap）→ 周期对齐
+    ; ---- 边界四步（空闲电平：LAT 低、CLKg 高）----
+    set pins, 0x0 [3]                   ; ① CLKg 拉低（LAT 本来就是低）——为空出上升沿
+    set pins, 0x2 [3]                   ; ② CLKg↑ = **栅极链前进一位**
+    set pins, 0x3 [3]                   ; ③ LAT↑ = **锁存**（此刻栅极链已是前进后的状态）
+    set pins, 0x2 [3]                   ; ④ LAT↓ = 释放；回到空闲（LAT 低、CLKg 高）
+    ; ---- 阳极数据：48 字节 = 3 组 × 16 字节，逐 bit 移出（LSB first）----
+do_data:
+    set y, 2
+grp:
+    set x, 15
+byte_loop:
+    out pins, 1 side 0                  ; bit0 数据，CLKa 拉低
+    nop        side 1                   ; CLKa 上升沿 → 阳极移位链采样
+    out pins, 1 side 0
+    nop        side 1
+    out pins, 1 side 0
+    nop        side 1
+    out pins, 1 side 0
+    nop        side 1
+    out pins, 1 side 0
+    nop        side 1
+    out pins, 1 side 0
+    nop        side 1
+    out pins, 1 side 0
+    nop        side 1
+    out pins, 1 side 0                  ; bit7 数据
+    jmp x-- byte_loop side 1            ; bit7 时钟上升沿 + 字节循环判断
+    jmp y-- grp [3]                     ; 组循环；[3] 给边界留出 tLS 余量
+.wrap                                    ; 回到 scan
