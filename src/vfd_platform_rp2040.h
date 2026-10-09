@@ -187,6 +187,8 @@ public:
     bool engineStalled() const;      /* 引擎当前是否卡住 */
     bool engineError() const { return _engineError; }
     uint32_t dmaBusyErrors() const { return _dmaBusyErrors; }
+    /* 扫描中断累计忙时（µs，单调递增；主循环按秒取差分算占用率）。仅 VFD_DEBUG_DIAG 下更新。 */
+    uint32_t irqBusyUs() const { return _irqUs; }
 
 private:
     /* ---- 引擎钩子：由 vfd_platform_rp2040_{tick,pio}.cpp 实现 ---- */
@@ -215,6 +217,7 @@ private:
     volatile uint8_t _copyLatest;
     volatile uint32_t _frameStarts;
     volatile uint32_t _scans;
+    volatile uint32_t _irqUs; /* 扫描中断累计忙时（µs） */
     volatile uint32_t _dmaBusyErrors;
     volatile int _scan;
 

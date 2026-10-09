@@ -84,11 +84,14 @@ Rp2040Platform::Rp2040Platform(const Rp2040Config &cfg)
     , _pwmWrap(0)
     , _maxLitUs(0)
     , _litWindowUs(0)
+    /* 初始化列表顺序必须与头文件里的成员声明顺序一致（否则 -Wreorder 警告）：
+     * _published → _active → _frameCopy → _copyLatest → … */
     , _published(nullptr)
-    , _copyLatest(0)
     , _active(nullptr)
+    , _copyLatest(0)
     , _frameStarts(0)
     , _scans(0)
+    , _irqUs(0)
     , _dmaBusyErrors(0)
     , _scan(0)
     , _engineError(false)
@@ -152,6 +155,7 @@ void Rp2040Platform::init()
     _active = nullptr;
     _frameStarts = 0;
     _scans = 0;
+    _irqUs = 0;
     _scan = 0;
     _dmaBusyErrors = 0;
     _engineError = false;

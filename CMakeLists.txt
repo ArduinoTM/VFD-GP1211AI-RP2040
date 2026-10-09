@@ -91,28 +91,48 @@ target_include_directories(vfd_gp1211ai_demo PRIVATE
 )
 
 # ---------------------------------------------------------------------------
-# 诊断输出开关（Debug / Release 条件编译）
-#   auto（默认）：CMAKE_BUILD_TYPE=Debug ⇒ 开；其余（Release 等）⇒ 关
-#   on / off    ：显式指定
-# 打开时逐秒打印 rx/cmd/data/gdram_crc/pinmon/slave-dbg/pc_hist/waits 与判读结论，并采样
-# 引脚跳变 / PIO PC 直方图；关闭时只留启动横幅与"出问题才打印"的告警（fatal/初始化失败/接线）。
+# 诊断输出开关。⚠️「诊断(diag)」和构建类型「Debug」是两回事：
+#   构建类型只决定优化级别与调试信息（-O2 / -Og -g），**不会**自动打开诊断输出。
+#   on        ：逐秒打印 rx/cmd/data/gdram_crc/CPU 占用/pinmon/slave-dbg/pc_hist/waits 与判读结论；
+#   off（默认）：只留启动横幅与"出问题才打印"的告警（fatal / 初始化失败 / 接线未通）。
 # 例：cmake -S . -B build -DPICO_SDK_PATH=... -DVFD_DEBUG_DIAG=on
 # ---------------------------------------------------------------------------
-set(VFD_DEBUG_DIAG "auto" CACHE STRING "诊断输出：auto|on|off（auto = Debug 构建开，其余关）")
-set_property(CACHE VFD_DEBUG_DIAG PROPERTY STRINGS auto on off)
-if(VFD_DEBUG_DIAG STREQUAL "auto")
-    if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-        set(_vfd_debug_diag 1)
-    else()
-        set(_vfd_debug_diag 0)
-    endif()
-elseif(VFD_DEBUG_DIAG)
+set(VFD_DEBUG_DIAG "off" CACHE STRING "诊断输出：on|off（默认 off）")
+set_property(CACHE VFD_DEBUG_DIAG PROPERTY STRINGS on off)
+string(TOLOWER "${VFD_DEBUG_DIAG}" _vfd_diag_lc) # -D 传 ON/OFF 也认（CMake 的 STREQUAL 是大小写敏感的）
+if(_vfd_diag_lc STREQUAL "on")
     set(_vfd_debug_diag 1)
 else()
     set(_vfd_debug_diag 0)
 endif()
 target_compile_definitions(vfd_gp1211ai_demo PRIVATE VFD_DEBUG_DIAG=${_vfd_debug_diag})
 message(STATUS "诊断输出: VFD_DEBUG_DIAG=${VFD_DEBUG_DIAG} ⇒ 宏 VFD_DEBUG_DIAG=${_vfd_debug_diag}")
+
+# 诊断输出是否也走 USB。默认 off：诊断只从 UART 输出，USB 串口保持干净
+# （USB stdio 的写会阻塞主循环，排故时不想因此扰动时序）。on 则诊断同时走 USB 与 UART。
+set(VFD_DEBUG_DIAG_USB "off" CACHE STRING "诊断是否也走 USB：on|off（默认 off = 只走 UART）")
+set_property(CACHE VFD_DEBUG_DIAG_USB PROPERTY STRINGS on off)
+string(TOLOWER "${VFD_DEBUG_DIAG_USB}" _vfd_diag_usb_lc)
+if(_vfd_diag_usb_lc STREQUAL "on")
+    target_compile_definitions(vfd_gp1211ai_demo PRIVATE VFD_DEBUG_DIAG_USB=1)
+    message(STATUS "诊断 USB 输出: 开（诊断同时走 USB 与 UART）")
+else()
+    message(STATUS "诊断 USB 输出: 关（诊断只走 UART）")
+endif()
+
+# ---------------------------------------------------------------------------
+# 双核任务分工（core0 = 时序 + 帧发布 + 看护；core1 = SSD1306 数据面）。
+# 默认关（单核，行为与历史版本一致）；打开后 core1 用 multicore_launch_core1 启动。
+# 资源不冲突：扫描引擎（core0）用 pio0/SPI0 + DMA0/1，SSD1306 从机（core1）用 pio1 + DMA2。
+# ---------------------------------------------------------------------------
+option(VFD_DUAL_CORE "双核分工：core0=时序+帧发布，core1=SSD1306 数据面" OFF)
+if (VFD_DUAL_CORE)
+    target_compile_definitions(vfd_gp1211ai_demo PRIVATE VFD_DUAL_CORE=1)
+    target_link_libraries(vfd_gp1211ai_demo PRIVATE pico_multicore)
+    message(STATUS "双核分工: 开（core1 = SSD1306 数据面，pico_multicore）")
+else()
+    message(STATUS "双核分工: 关（单核，与历史版本一致）")
+endif()
 
 target_compile_options(vfd_gp1211ai_demo PRIVATE
     -Wall -Wextra -Wno-unused-parameter
@@ -140,8 +160,12 @@ endif()
 
 if (VFD_STDIO_UART)
     pico_enable_stdio_uart(vfd_gp1211ai_demo 1)
+    # ⚠️ pico_enable_stdio_uart() 只会注入 LIB_PICO_STDIO_UART（库存在标志），**不会**注入
+    #    PICO_STDIO_UART。诊断落点要用它判断"UART 是否可用"，所以在这里自己注入一个明确的宏。
+    target_compile_definitions(vfd_gp1211ai_demo PRIVATE VFD_STDIO_UART_ENABLED=1)
 else()
     pico_enable_stdio_uart(vfd_gp1211ai_demo 0)
+    target_compile_definitions(vfd_gp1211ai_demo PRIVATE VFD_STDIO_UART_ENABLED=0)
 endif()
 
 pico_add_extra_outputs(vfd_gp1211ai_demo)

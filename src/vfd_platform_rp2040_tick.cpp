@@ -174,6 +174,9 @@ bool __not_in_flash_func(Rp2040Platform::scanTimerThunk)(repeating_timer_t *t)
 
 bool __not_in_flash_func(Rp2040Platform::scanTick)()
 {
+#if VFD_DEBUG_DIAG
+    const uint32_t irqT0 = time_us_32(); /* 诊断：ISR 忙时累计起点（VFD_DEBUG_DIAG） */
+#endif
     /* (1) PWM 计数器归零：BK 立即回到消隐，锁定点亮窗口相位在扫描周期尾部 */
     pwm_set_counter(static_cast<uint>(_pwmSlice), 0);
 
@@ -240,6 +243,9 @@ bool __not_in_flash_func(Rp2040Platform::scanTick)()
     if (++_scan >= SCANS_PER_FRAME)
         _scan = 0;
     _scans++;
+#if VFD_DEBUG_DIAG
+    _irqUs += time_us_32() - irqT0; /* 诊断：累计本次扫描中断的忙时 */
+#endif
     return true;
 }
 

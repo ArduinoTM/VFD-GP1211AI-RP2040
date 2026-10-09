@@ -114,7 +114,7 @@ bool Ssd1306SpiSlave::verifyWaitPins(const uint16_t *words, uint length)
     return true;
 }
 
-void Ssd1306SpiSlave::updatePending()
+void __not_in_flash_func(Ssd1306SpiSlave::updatePending)()
 {
     /* ---- 精确的"累计写入字数"----
      *        累计写入 = _base + (DMA_COUNT_FULL - remaining)
@@ -273,7 +273,7 @@ void Ssd1306SpiSlave::resetStream()
     pio_sm_set_enabled(_cfg.pio, _cfg.sm, true);
 }
 
-bool Ssd1306SpiSlave::popByte(uint8_t &value, bool &dc)
+bool __not_in_flash_func(Ssd1306SpiSlave::popByte)(uint8_t &value, bool &dc)
 {
     if (!_running)
         return false;
@@ -293,7 +293,7 @@ bool Ssd1306SpiSlave::popByte(uint8_t &value, bool &dc)
     return true;
 }
 
-void Ssd1306SpiSlave::task()
+void __not_in_flash_func(Ssd1306SpiSlave::task)()
 {
     if (!_running)
         return;

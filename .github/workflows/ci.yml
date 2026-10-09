@@ -1,6 +1,7 @@
 name: CI
 
-# 每次 push / PR：跑宿主机测试（不需要嵌入式工具链），并编译两种扫描引擎的固件
+# 每次 push / PR：跑宿主机测试（不需要嵌入式工具链），并编译 4 种固件组合
+# （tick / pio × 单核 / 双核），uf2 作为构建产物上传。
 on:
   push:
     branches: [ main ]
@@ -17,17 +18,23 @@ jobs:
       - name: 安装 g++
         run: sudo apt-get update && sudo apt-get install -y g++
 
-      - name: 运行宿主测试（241 项 + SDK 语法桩 + .ino 语法）
+      - name: 运行宿主测试（241 项 + 核间握手 79102 项 + SDK 语法桩 + .ino 语法）
         shell: pwsh
         run: ./tests/run_host_tests.ps1
 
   firmware:
-    name: 固件构建（${{ matrix.engine }}）
+    name: 固件构建（${{ matrix.engine }}${{ matrix.suffix }}）
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        engine: [ tick, pio ]
+        include:
+          # 单核（默认）：core1 不启动，与历史版本逐行为一致
+          - { engine: tick, dual: "OFF", suffix: "" }
+          - { engine: pio,  dual: "OFF", suffix: "" }
+          # 双核：core0 = 扫描时序 + 帧发布 + 看护，core1 = SSD1306 数据面
+          - { engine: tick, dual: "ON",  suffix: "-dual" }
+          - { engine: pio,  dual: "ON",  suffix: "-dual" }
     steps:
       - uses: actions/checkout@v4
 
@@ -41,22 +48,23 @@ jobs:
           git clone --depth 1 --branch 2.1.0 https://github.com/raspberrypi/pico-sdk.git "$RUNNER_TEMP/pico-sdk"
           cd "$RUNNER_TEMP/pico-sdk" && git submodule update --init --depth 1
 
-      - name: 配置与编译（引擎 ${{ matrix.engine }}）
+      - name: 配置与编译（引擎 ${{ matrix.engine }}，双核 ${{ matrix.dual }}）
         run: |
           cmake -S . -B build -G Ninja \
             -DPICO_SDK_PATH="$RUNNER_TEMP/pico-sdk" \
             -DPICO_BOARD=pico \
             -DCMAKE_BUILD_TYPE=Release \
-            -DVFD_SCAN_ENGINE=${{ matrix.engine }}
+            -DVFD_SCAN_ENGINE=${{ matrix.engine }} \
+            -DVFD_DUAL_CORE=${{ matrix.dual }}
           cmake --build build
 
       - name: 收集 uf2
         run: |
-          cp build/vfd_gp1211ai_demo.uf2 "vfd_gp1211ai_demo-${{ matrix.engine }}.uf2"
+          cp build/vfd_gp1211ai_demo.uf2 "vfd_gp1211ai_demo-${{ matrix.engine }}${{ matrix.suffix }}.uf2"
           ls -l *.uf2
 
       - uses: actions/upload-artifact@v4
         with:
-          name: uf2-${{ matrix.engine }}
-          path: vfd_gp1211ai_demo-${{ matrix.engine }}.uf2
+          name: uf2-${{ matrix.engine }}${{ matrix.suffix }}
+          path: vfd_gp1211ai_demo-${{ matrix.engine }}${{ matrix.suffix }}.uf2
           if-no-files-found: error

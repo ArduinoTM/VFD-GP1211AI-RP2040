@@ -270,8 +270,8 @@ static void phDisplayFlags()
     };
     for (unsigned i = 0; i < sizeof(steps) / sizeof(steps[0]); ++i) {
         sendCmds(&steps[i].cmd, 1);
-        logf("  → %s（保持 0.8 s）", steps[i].what);
-        delay(800);
+        logf("  → %s（保持 1 s）", steps[i].what);
+        delay(1000);
     }
 
     gExpectCrc = gCrcAfterWindow;
@@ -291,8 +291,8 @@ static void phContrastSweep()
         const uint8_t cmds[2] = { 0x81, levels[i] };
         sendCmds(cmds, 2);
         /* 同理：9 档一起发（18 字节 ≈36 µs）只会看到最后一档 ⇒ 每档保持 0.4 s 才看得见亮度变化 */
-        logf("  → 对比度 0x81 = 0x%02X（保持 0.4 s：VFD 亮度应随之变化）", levels[i]);
-        delay(400);
+        logf("  → 对比度 0x81 = 0x%02X（保持 1 s：VFD 亮度应随之变化）", levels[i]);
+        delay(1000);
     }
     logf("  对比度扫描结束：最后一档 0xFF = 最亮（不会再把亮度留在 0）");
     gExpectCrc = gCrcAfterWindow;

@@ -297,8 +297,26 @@ uint32_t to_ms_since_boot(absolute_time_t t);
 int64_t absolute_time_diff_us(absolute_time_t from, absolute_time_t to);
 void sleep_ms(uint32_t ms);
 void sleep_us(uint64_t us);
+uint32_t time_us_32(void);
 
 /* ------------------------------------------------------------ pico/stdlib */
 void stdio_init_all(void);
+
+/* stdio 驱动开关：真实构建里 pico_enable_stdio_uart() 只注入 LIB_PICO_STDIO_UART，
+ * 本工程自己在 CMake 里注入 VFD_STDIO_UART_ENABLED（默认 1）。桩里按"开"处理。 */
+#ifndef VFD_STDIO_UART_ENABLED
+#define VFD_STDIO_UART_ENABLED 1
+#endif
+
+/* --------------------------------------------------------- hardware/uart */
+typedef struct uart_inst uart_inst_t;
+extern uart_inst_t *const uart0;
+extern uart_inst_t *const uart1;
+void uart_write_blocking(uart_inst_t *uart, const uint8_t *src, size_t len);
+
+/* -------------------------------------------------------- pico/multicore */
+void multicore_launch_core1(void (*entry)(void));
+/* 真实 SDK 里在 hardware/sync.h 定义（跨核内存屏障）；语法检查桩里退化为空 */
+static inline void __dmb(void) { }
 
 #endif /* VFD_SDK_STUB_H */

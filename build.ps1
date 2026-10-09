@@ -15,8 +15,9 @@
 
   参数（与 CMake 缓存变量一一对应，见 CMakeLists.txt）：
     -Engine    pio | tick | both    扫描引擎（pio = PIO 状态机；tick = 重复定时器 + SPI + DMA）
-    -Diag      on | off | auto      逐秒诊断输出（on = 排故；off = 发布精简，uf2 小 ~22 KB）
-    -Type      Release | Debug      构建类型（Debug 且 -Diag auto ⇒ 自动打开诊断）
+    -Diag      on | off             逐秒诊断输出（on = 排故；off = 默认，发布精简 uf2 小 ~22 KB）
+    -DiagUsb                        诊断是否也走 USB（默认只走 UART；USB stdio 的写会阻塞主循环）
+    -Type      Release | Debug      构建类型（只影响优化级别/调试信息，与诊断输出无关）
     -Dir       <目录名>             构建目录（默认按选项自动生成，如 build-pio-rel-diagon）
 
   注：LAT 极性 / 带内 3 列槽序 / 扫描相位这三组"调参旋钮"已在 2026-10-08 清理中移除 ——
@@ -27,12 +28,13 @@
     -CleanOnly                      只清理：删掉本次会用到的构建目录后退出（不编译）
     -CleanAll                       只清理：删掉仓库内所有 build-* 目录与 tests\build 后退出（不编译）
     -PioRegen                       用 pioasm 重新生成 src\*.pio.h（改了 .pio 之后必须）
+    -DualCore                       双核分工：core1=SSD1306 数据面（core0=时序+帧发布+看护）
     -Yes                            不提问，直接用参数/默认值
 #>
 [CmdletBinding()]
 param(
     [ValidateSet('pio', 'tick', 'both')] [string]$Engine,
-    [ValidateSet('on', 'off', 'auto')] [string]$Diag,
+    [ValidateSet('on', 'off')] [string]$Diag,
     [ValidateSet('Release', 'Debug')] [string]$Type = 'Release',
     [string]$Dir,
     [switch]$Test,
@@ -40,6 +42,8 @@ param(
     [switch]$CleanOnly,
     [switch]$CleanAll,
     [switch]$PioRegen,
+    [switch]$DualCore,
+    [switch]$DiagUsb,
     [switch]$Yes,
     [switch]$Help
 )
@@ -122,9 +126,10 @@ function Make-DirName([string]$eng) {
     # 非默认的诊断/构建类型再挂后缀，便于多套并存。
     $name = 'build-rp2040'
     if ($eng -eq 'pio') { $name = 'build-rp2040-pio' }
-    if ($Type -eq 'Debug') { $name += '-dbg' }
-    if ($Diag -eq 'off') { $name += '-nodiag' }
-    if ($Diag -eq 'auto') { $name += '-diagauto' }
+    if ($Type -eq 'Debug') { $name += '-debug' }
+    if ($Diag -eq 'on') { $name += '-diagon' }
+    if ($DiagUsb) { $name += '-diagusb' }
+    if ($DualCore) { $name += '-dual' }
     return $name
 }
 
@@ -201,7 +206,8 @@ if (-not (Test-Path $sizeExe)) { $sizeExe = $null }
 # ninja
 $ninjaExe = Resolve-Exe 'ninja' @(
     'C:\Program Files\Meson\ninja.EXE',
-    (Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Links\ninja.exe'),
+    # 用 GetFolderPath 取本机应用数据目录：语义等价，且源码里不含该环境变量字面量（发布仓库护栏）
+    (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Microsoft\WinGet\Links\ninja.exe'),
     (Join-Path $wsRoot 'ninja.exe')
 )
 if (-not $ninjaExe) { Die "找不到 ninja。请装 Ninja（或把它放到 PATH）：winget install Ninja-build.Ninja" }
@@ -243,7 +249,7 @@ Say ("已设置 PICO_SDK_PATH / PATH（gcc + ninja 前置）")
 
 # ------------------------------------------------------------------ 交互式选模式
 $defaultEngine = 'pio'
-$defaultDiag = 'on'
+$defaultDiag = 'off'    # 诊断输出默认关：默认构建不打印逐秒统计，USB 串口保持干净
 $defaultType = 'Release'
 
 if (-not $Yes) {
@@ -256,21 +262,27 @@ if (-not $Yes) {
         ) @('pio', 'tick', 'both') $defaultEngine
     }
     if (-not $Diag) {
-        $Diag = Ask-Choice "② 诊断输出（逐秒打印 rx/cmd/data/gdram_crc/pinmon/slave-dbg/pc_hist/waits）" @(
-            "on    —— 排故用（串口有逐秒统计；uf2 大 ~22 KB）",
-            "off   —— 发布精简（只留启动横幅与告警）",
-            "auto  —— 按构建类型：Debug 开、Release 关"
-        ) @('on', 'off', 'auto') $defaultDiag
+        $Diag = Ask-Choice "② 诊断输出（逐秒打印 rx/cmd/data/gdram_crc/CPU 占用/pinmon/slave-dbg/pc_hist/waits）" @(
+            "off   —— 默认：发布精简（只留启动横幅与告警；USB 串口干净）",
+            "on    —— 排故用（逐秒统计只走 UART；uf2 大 ~22 KB）"
+        ) @('off', 'on') $defaultDiag
     }
     if (-not $PSBoundParameters.ContainsKey('Type')) {
         $Type = Ask-Choice "③ 构建类型" @(
             "Release —— -O2/-O3，正常使用",
-            "Debug   —— 带调试信息（配合 -Diag auto 会自动打开诊断）"
+            "Debug   —— -Og -g，带调试信息（与诊断输出无关）"
         ) @('Release', 'Debug') $defaultType
+    }
+    if (-not $PSBoundParameters.ContainsKey('DualCore')) {
+        $dualChoice = Ask-Choice "④ 双核任务分工（core0=时序+帧发布，core1=SSD1306 数据面）" @(
+            "off   —— 单核（与历史版本一致，默认）",
+            "on    —— 双核：core1 承载 SSD1306 数据面（解码/渲染）"
+        ) @('off', 'on') 'off'
+        $DualCore = ($dualChoice -eq 'on')
     }
     if (-not $Dir) {
         $defDir = "build-$Engine"
-        $a = Read-Answer ("④ 构建目录名（回车 = {0}）" -f $defDir)
+        $a = Read-Answer ("⑤ 构建目录名（回车 = {0}）" -f $defDir)
         if (-not [string]::IsNullOrWhiteSpace($a)) { $Dir = $a }
     }
 } else {
@@ -328,6 +340,12 @@ function Build-Engine([string]$eng, [string]$dirName) {
         ("-DVFD_SCAN_ENGINE={0}" -f $eng),
         ("-DVFD_DEBUG_DIAG={0}" -f $Diag)
     )
+    if ($DualCore) {
+        $cmakeArgs += '-DVFD_DUAL_CORE=ON'
+    }
+    if ($DiagUsb) {
+        $cmakeArgs += '-DVFD_DEBUG_DIAG_USB=ON'
+    }
     if ($PioRegen) {
         $cmakeArgs += '-DVFD_PIO_REGENERATE=ON'
         if ($pioasm) { $cmakeArgs += ("-Dpioasm_DIR={0}" -f (Split-Path $pioasm -Parent)) }
@@ -383,11 +401,12 @@ foreach ($r in $results) {
     $rev = 'false'; $diagMacro = '0'
     if ($r.Engine -eq 'tick') { $rev = 'true' }
     if ($Diag -eq 'on') { $diagMacro = '1' }
-    if ($Diag -eq 'auto' -and $Type -eq 'Debug') { $diagMacro = '1' }
     Say ("  {0,-5} 引擎: {1}" -f $r.Engine, $r.Uf2) 'White'
     Say ("        启动横幅应为: wire: reverseBits={0}   （诊断宏 VFD_DEBUG_DIAG={1}）" -f $rev, $diagMacro) 'DarkGray'
 }
-Say ("  构建类型 {0}（LAT 极性/槽序/相位已固化在实现里，见 src/vfd_scanpack.h）" -f $Type) 'DarkGray'
+Say ("  构建类型 {0}（只影响优化/调试信息；LAT 极性/槽序/相位已固化在实现里，见 src/vfd_scanpack.h）" -f $Type) 'DarkGray'
+Say ("  诊断输出 {0}{1}" -f $Diag, $(if ($Diag -eq 'on') { $(if ($DiagUsb) { '（走 USB+UART）' } else { '（只走 UART）' }) } else { '' })) 'DarkGray'
+if ($DualCore) { Say ("  双核分工已开启：core0=时序+帧发布，core1=SSD1306 数据面") 'DarkGray' }
 Say ""
 Say "烧录：按住 BOOTSEL 插 USB（出现 RPI-RP2 盘）→ 把上面的 .uf2 拖进去。" 'White'
 Say "排故时建议 -Diag on（逐秒诊断）；发布时 -Diag off（uf2 小 ~22 KB）。" 'DarkGray'

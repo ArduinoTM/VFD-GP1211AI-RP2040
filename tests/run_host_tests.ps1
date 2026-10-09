@@ -99,6 +99,15 @@ Build-And-Run 'master_phases_host_tests' @(
 )
 
 # ---------------------------------------------------------------------------
+# ⑤b 跨核帧缓冲握手（2 槽 SPSC，core1→core0 帧发布协议）纯逻辑不变量测试
+#    测 src/dualcore_handoff.h（生产用的同一份头）：槽位映射 + 可写边界 +
+#    "生产者永不覆盖消费者未读帧"（随机交错仿真）。
+# ---------------------------------------------------------------------------
+Build-And-Run 'dualcore_handoff' @(
+    (Join-Path $PSScriptRoot 'test_dualcore_handoff.cpp')
+)
+
+# ---------------------------------------------------------------------------
 # ⑥ 主控测试程序（examples 下的 .ino）语法检查
 #    本机没有 arduino-cli，用 Arduino/SPI/U8g2 形状桩把 sketch 编译一遍，
 #    提前抓 API/拼写错误；桩的签名对照真实核心与库，见 stub_arduino/Arduino.h 注释
@@ -124,6 +133,9 @@ $syntaxTargets = @(
     @{ File = 'src/vfd_platform_rp2040.cpp'; Engine = '0' },
     @{ File = 'src/vfd_platform_rp2040_tick.cpp'; Engine = '0' },
     @{ File = 'src/vfd_platform_rp2040_pio.cpp'; Engine = '1' },
+    # 打开诊断开关再来一遍：验证中断忙时打点（irqUs）那段代码也能编译
+    @{ File = 'src/vfd_platform_rp2040_tick.cpp'; Engine = '0'; Def = '-DVFD_DEBUG_DIAG=1' },
+    @{ File = 'src/vfd_platform_rp2040_pio.cpp'; Engine = '1'; Def = '-DVFD_DEBUG_DIAG=1' },
     @{ File = 'src/ssd1306_emulator.cpp'; Engine = '0' },
     @{ File = 'src/ssd1306_emulator.cpp'; Engine = '1' },
     @{ File = 'src/ssd1306_slave_rp2040.cpp'; Engine = '0' },
@@ -131,11 +143,16 @@ $syntaxTargets = @(
     @{ File = 'src/main.cpp'; Engine = '0'; Def = '-DVFD_DEBUG_DIAG=0' },
     @{ File = 'src/main.cpp'; Engine = '1'; Def = '-DVFD_DEBUG_DIAG=0' },
     @{ File = 'src/main.cpp'; Engine = '0'; Def = '-DVFD_DEBUG_DIAG=1' },
-    @{ File = 'src/main.cpp'; Engine = '1'; Def = '-DVFD_DEBUG_DIAG=1' }
+    @{ File = 'src/main.cpp'; Engine = '1'; Def = '-DVFD_DEBUG_DIAG=1' },
+    @{ File = 'src/main.cpp'; Engine = '0'; Def = '-DVFD_DUAL_CORE=1'; Def2 = '-DVFD_DEBUG_DIAG=0' },
+    @{ File = 'src/main.cpp'; Engine = '1'; Def = '-DVFD_DUAL_CORE=1'; Def2 = '-DVFD_DEBUG_DIAG=0' },
+    @{ File = 'src/main.cpp'; Engine = '0'; Def = '-DVFD_DUAL_CORE=1'; Def2 = '-DVFD_DEBUG_DIAG=1' },
+    @{ File = 'src/main.cpp'; Engine = '1'; Def = '-DVFD_DUAL_CORE=1'; Def2 = '-DVFD_DEBUG_DIAG=1' }
 )
 foreach ($t in $syntaxTargets) {
     $defs = @("-DVFD_SCAN_ENGINE_PIO=$($t.Engine)")
     if ($t.Def) { $defs += $t.Def }
+    if ($t.Def2) { $defs += $t.Def2 }
     $label = ($defs -join ' ')
     Write-Host "语法检查(SDK 桩, $label): $($t.File)" -ForegroundColor DarkGray
     & $cxx '-std=c++17' '-fsyntax-only' '-Wall' '-Wextra' '-Wno-unused-parameter' @defs @stubInc (Join-Path $root $t.File)
