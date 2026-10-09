@@ -30,7 +30,7 @@ cmake -S . -B build -DPICO_SDK_PATH=/path/to/pico-sdk \
   `pwm_gpio_to_slice_num/channel` 自动取 slice）；
 * `VFD_DMA_*` 选两个未被占用的 DMA 通道（RP2040 共 12 个）。
 
-### 2.1 使用 PIO 引擎（`-DVFD_SCAN_ENGINE=pio`）时的额外约束
+### 1.1 使用 PIO 引擎（`-DVFD_SCAN_ENGINE=pio`）时的额外约束
 
 | 项 | 约束 / 默认值 |
 |---|---|
@@ -42,7 +42,7 @@ cmake -S . -B build -DPICO_SDK_PATH=/path/to/pico-sdk \
 | DMA | PIO 引擎只用 1 个通道（`-DVFD_DMA_CH`，默认 0），不需要 RX 通道 |
 | 接线表 | **与 tick 引擎完全相同**，无需改线 |
 
-### 2.2 作为 SSD1306 从机时（主机 → 本机）
+### 1.2 作为 SSD1306 从机时（主机 → 本机）
 
 | 主机 MCU | 本机 Pico | 约束 / 说明 |
 |---|---|---|
