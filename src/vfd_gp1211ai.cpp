@@ -28,6 +28,7 @@ VFD_GP1211AI::VFD_GP1211AI(vfd::Platform &platform)
     , _faults(0)
     , _recoverAttempts(0)
     , _fatal(false)
+    , _powerUpDone(true) /* 未调用 begin/beginAsync 时视为"无需推进" */
 {
     memset(_framebuffer, 0, sizeof(_framebuffer));
     memset(_frameBuffer, 0, sizeof(_frameBuffer));
@@ -37,7 +38,7 @@ VFD_GP1211AI::VFD_GP1211AI(vfd::Platform &platform)
     cp437(true);
 }
 
-void VFD_GP1211AI::begin(uint32_t preheat_ms)
+void VFD_GP1211AI::beginAsync(uint32_t preheat_ms)
 {
     memset(_framebuffer, 0, sizeof(_framebuffer));
 
@@ -52,13 +53,35 @@ void VFD_GP1211AI::begin(uint32_t preheat_ms)
     _published = true;
     _writeIndex = 1;
 
-    _platform.powerUp(preheat_ms);
-    _platform.setBrightness(_brightness);
+    /* 只"开始"上电时序（关高压 → 灯丝上电 → 预热），不在这里阻塞 */
+    _powerUpDone = false;
+    _platform.powerUpBegin(preheat_ms);
+}
 
+bool VFD_GP1211AI::pumpPowerUp()
+{
+    if (_powerUpDone)
+        return true;
+    if (!_platform.powerUpPoll())
+        return false;
+
+    /* 时序完成（高压已上电）→ 收尾，与旧 begin() 的尾部逐项一致 */
+    _platform.setBrightness(_brightness);
     _lastScanCount = _platform.scanCount();
     _lastScanMillis = _platform.millis();
     _recoverAttempts = 0;
     _fatal = false;
+    _powerUpDone = true;
+    return true;
+}
+
+void VFD_GP1211AI::begin(uint32_t preheat_ms)
+{
+    beginAsync(preheat_ms);
+    /* 阻塞版：等时序走完。默认实现（Platform::powerUpBegin 直接调用阻塞版 powerUp）
+     * 第一次 poll 就返回 true，因此对既有平台而言 begin() 的行为与旧版一致。 */
+    while (!pumpPowerUp())
+        _platform.delayMs(1);
 }
 
 /* ------------------------------------------------------------------ 绘图原语 */

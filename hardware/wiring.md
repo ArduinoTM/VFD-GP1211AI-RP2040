@@ -70,10 +70,13 @@ cmake -S . -B build -DPICO_SDK_PATH=/path/to/pico-sdk \
 
 * VDD1 = 5 V（逻辑），VDD2 = 45 V（显示，MAX 50 V），灯丝 2.9 Vac / 275 mAac。
 * 驱动板由 XL6007 从 5 V 升压产生 VH，由 LM9022 产生灯丝交流。
-* 代码里的上电顺序（`Rp2040Platform::powerUp()`）：
+* 代码里的上电顺序（`Rp2040Platform::powerUpBegin()` + `powerUpPoll()`；`powerUp()` 是同一时序的阻塞包装）：
   1. `HVEN=0`、`FLEN=1`（关高压、关灯丝驱动），BK 设为消隐/半亮；
   2. `FLEN=0`（灯丝上电）→ 预热 `preheat_ms`（默认 400 ms）；
   3. `HVEN=1`（高压上电）→ 20 ms 稳定。
+* **预热不阻塞 CPU**：上层用 `VFD_GP1211AI::beginAsync()` + `pumpPowerUp()` 把 440 ms 切成片，
+  片与片之间继续服务主机链路（SSD1306 从机的 DMA 环形缓冲）。主机接收通路在 `main()` 里
+  **先于**上电时序启动，所以复位后主机发来的初始化序列与首批画面不会丢（见 docs/05 §8.2.1）。
 * `emergencyOff()` 的顺序相反：**先关高压，再停扫描**（手册 Note 14）。
 
 ## 3. 安全提醒
@@ -129,7 +132,9 @@ BK→CLKg 相位，以及**采样间隔分布**（用来判断抓包是否丢样
 ## 5. SSD1306 从机联调核对点
 
 1. 上电日志（USB 串口）应打印 `mode: SSD1306 emulator`（测试脚为高）或
-   `mode: TEST IMAGE`（测试脚被拉低）；
+   `mode: TEST IMAGE`（测试脚被拉低）；模拟模式下紧接着的
+   `boot capture: N B received before this loop (overrun=… drop=…)` 是**上电窗口**的接收量：
+   主机若在 RP2040 复位后立即发初始化序列 + 一帧（≈1 KB），N 应 ≥1050、overrun/drop 应为 0；
 2. 主机侧用示波器确认 SCK 空闲为低、数据在上升沿稳定（模式 0），DC 在整字节期间保持不变；
 3. 主机 `display()` 之后，日志里的 `rx=`/`data=` 计数应增加（每次整屏刷新 ≈1030 字节：
    21 个初始化/窗口命令 + 1024 数据），`overrun=`/`drop=` 应保持 0，`stall=0`；

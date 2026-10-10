@@ -107,6 +107,9 @@ Rp2040Platform::Rp2040Platform(const Rp2040Config &cfg)
     , _rxSink(0)
     , _guardMarginUs(0)
 #endif
+    , _preheatMs(0)
+    , _powerUpDeadlineUs(0)
+    , _powerUpPhase(0)
 {
 #if VFD_SCAN_ENGINE_PIO
     memset(_blankFrame, 0, sizeof(_blankFrame));
@@ -221,17 +224,64 @@ void Rp2040Platform::setBrightness(uint8_t brightness)
     applyPwmLevel(_pwmSlice, _pwmChannel, _pwmWrap, _litWindowUs);
 }
 
+/* 上电时序的固定等待（ms）；预热时长由调用方给定（默认 400，见 DEFAULT_PREHEAT_MS） */
+static constexpr uint32_t POWERUP_FL_PULSE_MS = 20;
+static constexpr uint32_t POWERUP_HV_SETTLE_MS = 20;
+
+/* 截止时刻比较：对 time_us_32() 的 71 分钟回绕安全 */
+static inline bool powerUpDeadlineReached(uint32_t deadlineUs)
+{
+    return static_cast<int32_t>(time_us_32() - deadlineUs) >= 0;
+}
+
 void Rp2040Platform::powerUp(uint32_t preheat_ms)
 {
+    /* 阻塞版 = 开始 + 轮询到完成，等待序列与旧实现逐项一致（20 + preheat + 20 ms，
+     * 只是轮询粒度从整段 sleep 变成 1 ms）。 */
+    powerUpBegin(preheat_ms);
+    while (!powerUpPoll())
+        sleep_ms(1);
+}
+
+void Rp2040Platform::powerUpBegin(uint32_t preheat_ms)
+{
+    /* 手册 Note 3 的上电时序，拆成可被主循环推进的三步：
+     *   ① HVEN=0、FLEN 脉冲（灯丝驱动自检）      —— POWERUP_FL_PULSE_MS
+     *   ② FLEN=0（灯丝上电）→ 预热                —— preheat_ms
+     *   ③ HVEN=1（VDD2 ≈ 45 V 上电）→ 稳定        —— POWERUP_HV_SETTLE_MS
+     * 预热期间上层可以继续服务其它硬件（见 Platform::powerUpBegin 的注释）。 */
+    _preheatMs = preheat_ms;
     gpio_put(_cfg.pin_hv_en, 0);
     gpio_put(_cfg.pin_fl_en, 1);
-    sleep_ms(20);
+    _powerUpDeadlineUs = time_us_32() + POWERUP_FL_PULSE_MS * 1000u;
+    _powerUpPhase = 1;
+}
 
-    gpio_put(_cfg.pin_fl_en, 0); /* 灯丝上电 */
-    sleep_ms(preheat_ms);        /* 预热（默认 400 ms） */
-
-    gpio_put(_cfg.pin_hv_en, 1); /* 高压（VDD2 ≈ 45 V）上电 */
-    sleep_ms(20);
+bool Rp2040Platform::powerUpPoll()
+{
+    switch (_powerUpPhase) {
+    case 1:
+        if (!powerUpDeadlineReached(_powerUpDeadlineUs))
+            return false;
+        gpio_put(_cfg.pin_fl_en, 0); /* 灯丝上电 */
+        _powerUpDeadlineUs = time_us_32() + _preheatMs * 1000u;
+        _powerUpPhase = 2;
+        return false;
+    case 2:
+        if (!powerUpDeadlineReached(_powerUpDeadlineUs))
+            return false;
+        gpio_put(_cfg.pin_hv_en, 1); /* 高压（VDD2 ≈ 45 V）上电 */
+        _powerUpDeadlineUs = time_us_32() + POWERUP_HV_SETTLE_MS * 1000u;
+        _powerUpPhase = 3;
+        return false;
+    case 3:
+        if (!powerUpDeadlineReached(_powerUpDeadlineUs))
+            return false;
+        _powerUpPhase = 0; /* 时序完成（0 = 未开始/已完成，幂等） */
+        return true;
+    default:
+        return true;
+    }
 }
 
 void Rp2040Platform::emergencyOff()

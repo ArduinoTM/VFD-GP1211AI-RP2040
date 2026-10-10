@@ -167,6 +167,8 @@ public:
 
     void init() override;
     void powerUp(uint32_t preheat_ms) override;
+    void powerUpBegin(uint32_t preheat_ms) override;
+    bool powerUpPoll() override;
     void emergencyOff() override;
     void setBrightness(uint8_t brightness) override;
     void publishFrame(const uint8_t *frame) override;
@@ -249,6 +251,11 @@ private:
     void startScanTimer();
     void stopScanTimer();
 #endif
+
+    /* ---- 非阻塞上电时序的状态（powerUpBegin/powerUpPoll；0 = 未开始/已完成）---- */
+    uint32_t _preheatMs;          /* 本次预热的毫秒数 */
+    uint32_t _powerUpDeadlineUs;  /* 当前阶段的截止时刻（time_us_32 基准，回绕安全） */
+    uint8_t _powerUpPhase;
 };
 
 } /* namespace vfd */

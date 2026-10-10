@@ -31,9 +31,21 @@ public:
      * 返回后允许立刻 publishFrame()。 */
     virtual void init() = 0;
 
-    /* 上电时序：先逻辑与灯丝、预热、后高压（手册 Note 3）。
-     * 内部会阻塞 preheat_ms 毫秒。 */
+    /* 上电时序：先逻辑与灯丝、预热、后高压（手册 Note 3）。阻塞版：返回时高压已上电。 */
     virtual void powerUp(uint32_t preheat_ms) = 0;
+
+    /* 同一段上电时序的**非阻塞**版本：powerUpBegin() 立即返回（关高压 → FLEN 脉冲
+     * → 灯丝上电 → 开始预热），powerUpPoll() 由主循环反复调用推进，返回 true 表示
+     * 整段时序完成（幂等，可重复调用）。
+     *
+     * 为什么需要：预热默认 400 ms。若这段时间 CPU 只是 sleep，任何需要及时服务的
+     * 硬件（例如 SSD1306 从机的 DMA 环形缓冲）就只能靠有限缓冲兜底，主机的初始化
+     * 序列与首批画面会丢 —— 上层用这两个接口就能"边预热边服务"。
+     *
+     * 默认实现退化为阻塞版 powerUp()，因此既有平台实现（含宿主测试的 MockPlatform）
+     * 不需要任何改动。 */
+    virtual void powerUpBegin(uint32_t preheat_ms) { powerUp(preheat_ms); }
+    virtual bool powerUpPoll() { return true; }
 
     /* 紧急关断：先关高压再停扫描（保护屏），用于扫描故障无法恢复时。 */
     virtual void emergencyOff() = 0;

@@ -92,11 +92,21 @@ static constexpr uint32_t STATS_PERIOD_MS = 1000;
  * 取 12 ms（≈83 fps）以便最快档滚动（2 帧/步 = 16 ms）能被完整呈现。 */
 static constexpr uint32_t EMU_RENDER_MIN_MS = 12;
 
-static uint8_t gRenderBuffer[vfd::FRAMEBUFFER_SIZE];
-
 /* SSD1306 模拟模式的常驻对象（16 KB 环形缓冲要求对齐，放 .bss；构造函数不访问硬件） */
 static vfd::Ssd1306SpiSlave gSlave;
 static vfd::Ssd1306Emulator gEmu;
+
+/* 单核渲染缓冲（core0 自己渲染、自己发布）。双核下 core1 直接渲染进 handoff 槽，
+ * core0 不再需要它 —— 而且 core0 **不能**再访问模拟器（core1 是唯一所有者）。 */
+#if !VFD_DUAL_CORE
+static uint8_t gRenderBuffer[vfd::FRAMEBUFFER_SIZE];
+#endif
+
+/* 主机接收通路（SSD1306 从机）是否已启动：防止重复 begin / 重复启动 core1 */
+static bool gHostLinkArmed = false;
+#if VFD_DUAL_CORE
+static bool gCore1Launched = false;
+#endif
 
 #if VFD_DUAL_CORE
 /* core1 → core0 的帧缓冲握手 + 少量控制消息（协议见 src/dualcore_handoff.h）。
@@ -121,6 +131,67 @@ static volatile uint32_t gCore1DrainUs;
 static volatile uint32_t gCore1RenderUs;
 #endif
 #endif
+
+/* ---------------------------------------------------- 主机链路：上电即抓取 ----
+ * 现场问题（2026-10）：main() 原来的顺序是 display.begin()（内含灯丝预热
+ * sleep_ms(preheat_ms)，默认 400 ms）→ 打印启动横幅 → 才调用 slave.begin() 打开
+ * PIO+DMA 接收通路。也就是说**复位后的前 ~500 ms 里，主机发来的 SSD1306 初始化
+ * 序列与首批画面数据全部丢失**：主机与 RP2040 同时上电、或主机早已在运行而
+ * RP2040 被复位时，模拟器就会漏掉初始化（寻址模式 / 段重映射 / COM 扫描方向 /
+ * 显示开关 / 对比度全停在默认值），典型症状是镜像、翻转、错位，甚至一直不亮，
+ * 直到主机重新初始化为止。
+ *
+ * 处置：接收通路（PIO + DMA 环形缓冲，与扫描引擎资源不重叠）不依赖扫描引擎，
+ * 于是把它提到 main() 的**最前面**启动，上电即开始接收；预热与横幅这两段窗口
+ * 用 serviceHostLink() 持续排水兜住（单核），双核则由 core1 全程排水。 */
+
+/* 取走环形缓冲里的字节交给模拟器。单核由 core0 调用；**双核下是空实现**：
+ * core1 是环形缓冲的唯一消费者，core0 碰它的游标/计数就会撕裂数据通路。 */
+static void serviceHostLink()
+{
+#if !VFD_DUAL_CORE
+    if (!gSlave.running())
+        return;
+
+    gSlave.task(); /* CS 边沿 / 事务边界 / 环形缓冲计数补充 */
+    if (gSlave.consumeResetEvent())
+        gEmu.reset();
+
+    uint8_t value;
+    bool dc;
+    while (gSlave.popByte(value, dc))
+        gEmu.pushByte(value, dc);
+
+    /* 排空之后才能判定"事务结束"（调用约定见 ssd1306_slave_rp2040.h） */
+    if (gSlave.consumeTransactionEnd())
+        gEmu.endTransaction();
+#endif
+}
+
+/* 启动横幅用的打印：按 32 字节一段写出，**段间排空主机链路**。
+ * 与诊断打印同一个理由（见下面 printChunked 的注释）：一行横幅在 115200 下要
+ * 8 ms 才发得完，而 4 MHz 的 SPI 主机 8 ms 就能写满 4 KB 的环形缓冲；
+ * 切成 32 字节一段（~2.8 ms ⇒ ≤1.4 KB）就安全了。
+ * 双核下 serviceHostLink() 是空操作（core1 一直在排水），这里同样安全。 */
+static void bootPrintf(const char *fmt, ...)
+{
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+
+    const size_t n = strlen(buf);
+    for (size_t off = 0; off < n; off += 32) {
+        const size_t chunk = (n - off > 32) ? 32 : (n - off);
+        fwrite(buf + off, 1, chunk, stdout);
+        /* 必须显式 flush：newlib 的 stdout 可能是行缓冲/全缓冲，不 flush 的话
+         * 32 字节的"分块"只会在缓冲里堆积，真正的 UART 阻塞写挤到一次 flush 里发生，
+         * 段间排水就落空了（USB CDC 的写还可能长时间阻塞）。 */
+        fflush(stdout);
+        serviceHostLink();
+    }
+}
 
 /* ---------------------------------------------------------------- 打印 + 边打边取
  * 诊断行又长又多，而 UART 115200 下一行 90 字符要 ~8 ms；模拟器的 DMA 环是 16 KB，
@@ -244,13 +315,26 @@ static void runSsd1306EmulatorLoop(VFD_GP1211AI &display, vfd::Rp2040Platform &p
     vfd::Ssd1306SpiSlave &slave = gSlave;
     vfd::Ssd1306Emulator &emu = gEmu;
 
-    printf("  mode: SSD1306 emulator (VFD_PIN_TEST_MODE 上电为高)\n");
-    printf("  slave pins: SCK=GP%u MOSI=GP%u DC=GP%u CS=GP%u RESET=%d\n",
+    bootPrintf("  mode: SSD1306 emulator (VFD_PIN_TEST_MODE 上电为高)\n");
+    bootPrintf("  slave pins: SCK=GP%u MOSI=GP%u DC=GP%u CS=GP%u RESET=%d\n",
         slaveCfg.pin_sck, slaveCfg.pin_mosi, slaveCfg.pin_dc, slaveCfg.pin_cs,
         slaveCfg.pin_reset == 0xFF ? -1 : static_cast<int>(slaveCfg.pin_reset));
-    printf("  master must use SPI mode 0 (CPOL=0, CPHA=0); DC 必须接在 MOSI+1\n");
+    bootPrintf("  master must use SPI mode 0 (CPOL=0, CPHA=0); DC 必须接在 MOSI+1\n");
+    /* 启动窗口可观测性（验收判据）：复位→主循环之间到底收了多少字节、丢了没有。
+     * 主机在 RP2040 复位后立即发 init + 一帧（≈1 KB）时，这里应 ≥ 1050。 */
+    bootPrintf("  boot capture: %lu B received before this loop (overrun=%lu drop=%lu)\n",
+        static_cast<unsigned long>(slave.receivedCount()),
+        static_cast<unsigned long>(slave.overrunCount()),
+        static_cast<unsigned long>(slave.droppedCount()));
+    bootPrintf("  emu after boot: disp=%d contrast=%u addr=%u segRemap=%d comRev=%d gdram_crc=0x%08lx\n",
+        emu.displayOn() ? 1 : 0, static_cast<unsigned>(emu.contrast()),
+        static_cast<unsigned>(emu.addressingMode()),
+        emu.segmentRemap() ? 1 : 0, emu.comScanReversed() ? 1 : 0,
+        static_cast<unsigned long>(emu.gdramCrc32()));
 
-    if (!slave.begin()) {
+    /* 接收通路已在 main() 的 startHostLink() 里、**灯丝预热之前**就启动了（上电即抓数据）；
+     * 这里只处理初始化失败的情况。 */
+    if (!slave.running()) {
         printf("!! SSD1306 slave init failed: %s\n", slave.lastError());
         display.clearDisplay();
         display.display();
@@ -611,9 +695,16 @@ static void __not_in_flash_func(core1Ssd1306DataPlane)()
     vfd::Ssd1306SpiSlave &slave = gSlave;
     vfd::Ssd1306Emulator &emu = gEmu;
 
-    if (!slave.begin()) {
-        gHandoff.slaveFailed = 1;
-        return; /* core0 会打印错误并继续跑看护，保持扫描心跳 */
+    /* 从机接收通路已由 startHostLink() 在 core0 上启动（上电即抓数据，见那里的注释）。
+     * core1 只做消费者：**不再**调用 slave.begin() —— 重复装载 PIO 程序 / 重置 DMA 与
+     * 环形缓冲游标会把启动窗口里刚收到的数据抹掉。 */
+    if (!slave.running()) {
+        gHandoff.slaveFailed = 1; /* 初始化失败：core0 负责打印原因并保持扫描心跳 */
+        /* ⚠️ 不能 return：core1 的入口地址是从 bootrom 跳进来的，返回地址指向启动例程，
+         * 返回属于未定义行为。正常路径下 startHostLink() 只在 begin() 成功后才启动 core1，
+         * 所以这里到不了 —— 留着是为了"万一"也不让 core1 跑飞。 */
+        for (;;)
+            tight_loop_contents();
     }
 
     int lastContrast = -1; /* 与单核一致：首个循环就推送初始对比度 */
@@ -685,22 +776,37 @@ static void runSsd1306EmulatorLoopDualCore(VFD_GP1211AI &display, vfd::Rp2040Pla
 {
     const vfd::Ssd1306SpiSlaveConfig slaveCfg = vfd::defaultSsd1306SpiSlaveConfig();
     vfd::Ssd1306SpiSlave &slave = gSlave;
+#if VFD_DEBUG_DIAG
+    /* 只在诊断打印里用到；模拟器本体由 core1 独占（core0 不得访问） */
     vfd::Ssd1306Emulator &emu = gEmu;
+#endif
 
-    printf("  mode: SSD1306 emulator (dual-core) (VFD_PIN_TEST_MODE 上电为高)\n");
-    printf("  slave pins: SCK=GP%u MOSI=GP%u DC=GP%u CS=GP%u RESET=%d\n",
+    bootPrintf("  mode: SSD1306 emulator (dual-core) (VFD_PIN_TEST_MODE 上电为高)\n");
+    bootPrintf("  slave pins: SCK=GP%u MOSI=GP%u DC=GP%u CS=GP%u RESET=%d\n",
         slaveCfg.pin_sck, slaveCfg.pin_mosi, slaveCfg.pin_dc, slaveCfg.pin_cs,
         slaveCfg.pin_reset == 0xFF ? -1 : static_cast<int>(slaveCfg.pin_reset));
-    printf("  master must use SPI mode 0 (CPOL=0, CPHA=0); DC 必须接在 MOSI+1\n");
+    bootPrintf("  master must use SPI mode 0 (CPOL=0, CPHA=0); DC 必须接在 MOSI+1\n");
+    /* 启动窗口可观测性（验收判据）：core1 从 startHostLink() 起就一直在排水，
+     * 主机在 RP2040 复位后立即发 init + 一帧（≈1 KB）时这里应 ≥ 1050，
+     * 且 overrun/drop 应为 0。模拟器状态不在这里读（core1 独占，跨核读取会撕裂）。 */
+    bootPrintf("  boot capture: %lu B received before this loop (overrun=%lu drop=%lu)\n",
+        static_cast<unsigned long>(slave.receivedCount()),
+        static_cast<unsigned long>(slave.overrunCount()),
+        static_cast<unsigned long>(slave.droppedCount()));
 
-    /* 初始全黑（SSD1306 上电默认 Display OFF）——在启动 core1 之前先发布一帧 */
-    emu.renderToFramebuffer(gRenderBuffer);
-    display.blitFramebuffer(gRenderBuffer);
-    display.display();
+    /* 初始全黑那一帧由 display.begin() 负责发布（见 VFD_GP1211AI::begin 的空白帧）。
+     * ⚠️ core1 从 startHostLink() 起就是模拟器的唯一所有者，core0 这里**不能**再调
+     * emu.renderToFramebuffer() 去读 GDDRAM —— 那会和 core1 的 pushByte 抢同一份状态。 */
 
-    multicore_launch_core1(core1Ssd1306DataPlane);
+    if (!gCore1Launched) { /* 兜底：正常路径已在 startHostLink() 里启动过了 */
+        gCore1Launched = true;
+        multicore_launch_core1(core1Ssd1306DataPlane);
+    }
 
-    uint32_t lastSeq = gHandoff.seq;
+    /* ⚠️ 从 0 起算（不是 gHandoff.seq）：预热/横幅期间 core1 可能已经渲染了几帧，
+     * 主循环第一轮就要把"最新那帧"发布上屏；否则主机若在启动窗口里发完就停，
+     * seq 不再变化 ⇒ 那帧内容永远上不了屏（"静默丢最后一帧"的启动版）。 */
+    uint32_t lastSeq = 0;
     bool slaveFailedReported = false;
 
 #if VFD_DEBUG_DIAG
@@ -877,6 +983,41 @@ static void runSsd1306EmulatorLoopDualCore(VFD_GP1211AI &display, vfd::Rp2040Pla
 }
 
 #endif /* VFD_DUAL_CORE */
+
+/* ------------------------------------------------------------------ 主机链路启动 */
+
+/* ⚠️ 必须在 display.begin()/beginAsync() **之前**调用（上电即抓数据，见文件前面
+ * "主机链路：上电即抓取"的说明）。放在 #if 之外是因为**单核构建也要用**。
+ *   · 从机初始化（PIO1 + DMA2 + GP11..15）与扫描引擎（PIO0/SPI0 + DMA0/1 + GP2..9）
+ *     资源不重叠，所以可以在 platform.init() 之前先起来；初始化一律在 core0 上串行
+ *     执行，避免与 core1 并发写 PIO/DMA 寄存器。
+ *   · 双核：随后立刻启动 core1 数据面 —— 预热与横幅期间它一直在排水，
+ *     环形缓冲不会被填满 ⇒ 上电过程一条字节都不丢。
+ *   · 单核：预热期间 CPU 阻塞在 sleep_ms() 里，只有 4096 B 的环形缓冲在兜
+ *     （4 MHz 满速 8.2 ms 就绕满一圈）。所以 `main()` 用 beginAsync()/pumpPowerUp()
+ *     把预热切片，切片之间调 serviceHostLink() 排水 —— 两条路径合起来才没有死区。 */
+static void startHostLink()
+{
+    if (gHostLinkArmed)
+        return;
+    gHostLinkArmed = true;
+
+    if (!gSlave.begin()) {
+        /* 失败原因由 runSsd1306EmulatorLoop*() 打印（这里不死等，保持扫描心跳） */
+#if VFD_DUAL_CORE
+        gHandoff.slaveFailed = 1;
+#endif
+        return;
+    }
+
+#if VFD_DUAL_CORE
+    if (!gCore1Launched) {
+        gCore1Launched = true;
+        multicore_launch_core1(core1Ssd1306DataPlane);
+    }
+#endif
+}
+
 /* ------------------------------------------------------------------- main */
 
 /* ⚠️ 常驻对象放 .bss —— 绝不能做成 main() 的局部变量：
@@ -893,46 +1034,72 @@ static VFD_GP1211AI gDisplay(gPlatform);
 
 int main()
 {
+    /* 上电采样测试模式脚（内部上拉，低 = 测试模式）。提到最前面有两个理由：
+     *   ① "上电电平"越早采样越准（原来是 platform.init() 之后才采的）；
+     *   ② 先知道要不要武装主机接收通路（测试模式不接收主机数据）。 */
+    const bool testMode = vfd::rp2040TestModeSelected();
+
     stdio_init_all();
 
     const vfd::Rp2040Config &cfg = gCfg;
     vfd::Rp2040Platform &platform = gPlatform;
     VFD_GP1211AI &display = gDisplay;
 
-    /* init() + 空白帧 + 上电时序（灯丝预热 preheat_ms，再上高压） */
-    display.begin(cfg.preheat_ms);
+    /* ⚠️ 顺序关键：**先**打开主机接收通路，**再**做灯丝预热与横幅打印。
+     * 反过来（旧顺序）会把复位后前 ~500 ms 的主机数据全丢掉 —— 初始化序列与首批
+     * 画面都收不到，模拟器状态与主机不一致。详见 startHostLink()/serviceHostLink()。 */
+    if (!testMode)
+        startHostLink();
 
-    /* 上电采样测试模式脚（内部上拉，低 = 测试模式） */
-    const bool testMode = vfd::rp2040TestModeSelected();
-
-    printf("\nVFD-GP1211AI-RP2040 demo\n");
-    printf("  scan engine: %s\n", platform.engineName());
+    /* init() + 空白帧 + **开始**上电时序，CPU 不阻塞：
+     * 预热这 440 ms（20 + 400 + 20）里
+     *   · 单核：由本循环持续排空主机链路。环形缓冲只有 4096 B（4 MHz 满速 8.2 ms
+     *     就绕满一圈），阻塞着等必然丢主机数据，所以必须切片排水；
+     *   · 双核：core1 数据面已在 startHostLink() 里启动并持续排水，core0 睡一下
+     *     即可（省电，且完全不影响接收）。 */
+    display.beginAsync(cfg.preheat_ms);
+    while (!display.pumpPowerUp()) {
 #if VFD_DUAL_CORE
-    printf("  core mode: dual-core (core0=timing+publish, core1=SSD1306 data plane)\n");
+        sleep_ms(1);
 #else
-    printf("  core mode: single-core\n");
+        if (gHostLinkArmed) {
+            serviceHostLink(); /* 预热切片之间排水 ⇒ 上电窗口零死区 */
+            tight_loop_contents();
+        } else {
+            sleep_ms(1); /* 测试模式未武装接收通路，无事可做 */
+        }
+#endif
+    }
+
+    /* 启动横幅全部走 bootPrintf()：分块写出、块间排水，避免横幅本身变成丢数据窗口 */
+    bootPrintf("\nVFD-GP1211AI-RP2040 demo\n");
+    bootPrintf("  scan engine: %s\n", platform.engineName());
+#if VFD_DUAL_CORE
+    bootPrintf("  core mode: dual-core (core0=timing+publish, core1=SSD1306 data plane)\n");
+#else
+    bootPrintf("  core mode: single-core\n");
 #endif
     /* 启动时打印"总线顺序配置"：用串口即可确认板上跑的到底是哪一版固件 */
-    printf("  wire: reverseBits=%d\n",
+    bootPrintf("  wire: reverseBits=%d\n",
         platform.wireReversesByteBits() ? 1 : 0);
-    printf("  CLKa=GP%u  SIa=GP%u  LAT=GP%u  CLKg=GP%u  SIg=GP%u  BK=GP%u  HVEN=GP%u  FLEN=GP%u\n",
+    bootPrintf("  CLKa=GP%u  SIa=GP%u  LAT=GP%u  CLKg=GP%u  SIg=GP%u  BK=GP%u  HVEN=GP%u  FLEN=GP%u\n",
         cfg.pin_clka, cfg.pin_sia, cfg.pin_lat, cfg.pin_clkg,
         cfg.pin_sig, cfg.pin_bk, cfg.pin_hv_en, cfg.pin_fl_en);
-    printf("  anode shift clock: %.3f MHz (manual limit 5 MHz)\n",
+    bootPrintf("  anode shift clock: %.3f MHz (manual limit 5 MHz)\n",
         static_cast<double>(platform.clockHz()) / 1e6);
-    printf("  scan period: %lu us -> %.1f Hz frame rate (%d scans/frame)\n",
+    bootPrintf("  scan period: %lu us -> %.1f Hz frame rate (%d scans/frame)\n",
         static_cast<unsigned long>(cfg.scan_period_us),
         1e6 / (static_cast<double>(cfg.scan_period_us) * vfd::SCANS_PER_FRAME),
         vfd::SCANS_PER_FRAME);
-    printf("  lit window: max %lu us of %lu us, blank guard %lu us (margin %lu us)\n",
+    bootPrintf("  lit window: max %lu us of %lu us, blank guard %lu us (margin %lu us)\n",
         static_cast<unsigned long>(platform.litWindowMaxUs()),
         static_cast<unsigned long>(cfg.scan_period_us),
         static_cast<unsigned long>(cfg.blank_guard_us),
         static_cast<unsigned long>(platform.guardMarginUs()));
     if (platform.engineError())
-        printf("  !! scan engine init failed - check pin mapping (LAT/CLKg/SIg must be consecutive)\n");
+        bootPrintf("  !! scan engine init failed - check pin mapping (LAT/CLKg/SIg must be consecutive)\n");
     /* 栅极链播种：tick 引擎内联在 0 号扫描；pio 引擎用"请求脚 + jmp pin"握手排在帧首扫描 */
-    printf("  frame-end grid seed: %s\n",
+    bootPrintf("  frame-end grid seed: %s\n",
         platform.engineName()[0] == 'p' ? "seed by CPU @ frame end" : "seed inline @ frame end");
 
     if (testMode) {

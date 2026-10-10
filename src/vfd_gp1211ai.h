@@ -42,8 +42,18 @@ public:
 
     explicit VFD_GP1211AI(vfd::Platform &platform);
 
-    /* 初始化平台 + 发布空白帧 + 上电时序（含灯丝预热） */
+    /* 初始化平台 + 发布空白帧 + 上电时序（含灯丝预热）；**阻塞**到高压上电 */
     void begin(uint32_t preheat_ms = vfd::DEFAULT_PREHEAT_MS);
+
+    /* begin() 的非阻塞版本：初始化 + 空白帧 + **开始**上电时序（关高压 → 灯丝上电 →
+     * 预热），立即返回；预热到点后由 pumpPowerUp() 自动上高压并完成收尾。
+     * 用途：预热那 400 ms 里 CPU 可以继续服务其它硬件（例如排空 SSD1306 从机的
+     * DMA 环形缓冲），消掉"上电接收死区"（见 main.cpp）。 */
+    void beginAsync(uint32_t preheat_ms = vfd::DEFAULT_PREHEAT_MS);
+
+    /* 推进上电时序；返回 true 表示已完成（幂等，可重复调用）。
+     * ⚠️ 完成之前不要调用 task()（扫描心跳基线尚未建立，会被误判为停摆）。 */
+    bool pumpPowerUp();
 
     /* ---- Adafruit_GFX 绘图原语（只有这 4 个会被基类其它 API 复用） ---- */
     void drawPixel(int16_t x, int16_t y, uint16_t color) override;
@@ -99,6 +109,7 @@ private:
     uint32_t _faults;
     uint32_t _recoverAttempts;
     bool _fatal;
+    bool _powerUpDone;        /* 上电时序是否已完成（beginAsync/pumpPowerUp 配对使用） */
 };
 
 #endif /* VFD_GP1211AI_H */
