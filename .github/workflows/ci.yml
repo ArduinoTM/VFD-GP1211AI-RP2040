@@ -12,6 +12,7 @@ jobs:
   host-tests:
     name: 宿主机测试
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -24,7 +25,10 @@ jobs:
 
   firmware:
     name: 固件构建（${{ matrix.engine }}${{ matrix.suffix }}）
+    # ⚠️ 测试不过就不产出 uf2：否则「测试挂了但固件能编」的提交会照样发出可下载产物。
+    needs: host-tests
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
