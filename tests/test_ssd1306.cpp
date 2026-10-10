@@ -722,6 +722,52 @@ static void test_command_dirty()
     }
 }
 
+/* ---------------------------------------------------------------------------
+ * P1-3 回归：SPI 事务边界（CS 释放 + 空闲去抖）必须让解析器从"丢一个字节"里恢复
+ *
+ * 命令是"命令字节 + 若干参数字节"的多字节序列。少一个字节，参数收集器就会把**下一条命令**
+ * 当成参数吃掉，且永不自行纠正 —— 症状正是"unknown 持续增长、gdram_crc 永不匹配、只能
+ * RESET 恢复"。endTransaction() 在事务边界作废"没收齐参数"的那条命令，把损失限制在一条以内。
+ * ------------------------------------------------------------------------- */
+static void test_transaction_resync()
+{
+    section("事务边界重同步（丢字节后自恢复）");
+
+    /* ① 丢参数：0x81 之后参数没到事务就结束了 ⇒ 边界处作废半条命令，
+     *    下一条命令必须被**当作命令**解析（否则会被吃成 0x81 的参数）。 */
+    {
+        vfd::Ssd1306Emulator e;
+        e.pushByte(0x81, false); /* 对比度，还需要 1 个参数 */
+        e.endTransaction();      /* CS 释放：参数没到齐 ⇒ 作废 */
+        e.pushByte(0xAF, false); /* 新事务里的第一条命令 */
+        check(e.displayOn(), "丢参数后：边界让下一条命令重新对齐（0xAF 生效）");
+        check(e.resyncCount() == 1, "丢参数后：resync 计数 +1");
+        check(e.contrast() == 0x7F, "丢参数后：半条命令未生效（对比度保持复位默认 0x7F）");
+    }
+
+    /* ② 参数到齐：边界必须是空操作（反向控制） */
+    {
+        vfd::Ssd1306Emulator e;
+        e.pushByte(0x81, false);
+        e.pushByte(0x0F, false); /* 参数到齐 ⇒ 立即 apply */
+        e.endTransaction();
+        check(e.resyncCount() == 0, "参数到齐时：边界不触发重同步");
+        check(e.contrast() == 0x0F, "参数到齐时：命令正常生效");
+    }
+
+    /* ③ 数据通路不受边界影响 */
+    {
+        vfd::Ssd1306Emulator e;
+        e.pushByte(0x20, false); e.pushByte(0x02, false); /* 页寻址（ADDR_PAGE=2） */
+        e.pushByte(0xB0, false);                          /* 页 0 */
+        e.pushByte(0x00, false);                          /* 列 0 */
+        for (int i = 0; i < 4; i++) e.pushByte(0xAA, true);
+        e.endTransaction();
+        check(e.dataCount() == 4, "数据字节计数不受边界影响");
+        check(e.gdram()[0] == 0xAA && e.gdram()[3] == 0xAA, "数据按页寻址写入正确");
+    }
+}
+
 int main()
 {
     printf("SSD1306 行为模拟（宿主机测试）\n");
@@ -737,6 +783,7 @@ int main()
     test_scroll();
     test_gdram_crc();
     test_command_dirty();
+    test_transaction_resync();
 
     printf("\n----------------------------------------\n");
     printf("检查项: %d, 失败: %d\n", g_checks, g_failures);

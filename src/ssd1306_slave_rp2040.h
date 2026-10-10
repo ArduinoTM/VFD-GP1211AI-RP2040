@@ -11,7 +11,7 @@
  * 组成 9 位字，从机侧天然获得逐字节 DC；而且不关心 CS 是否在整段通信中一直保持低
  * （u8g2 这类库会在一次 CS 内切换 DC），兼容性更好。
  *
- * 资源占用：1 个 PIO 状态机（15 条指令，任意 PIO 块）+ 1 个 DMA 通道 + 1 KB 环形缓冲。
+ * 资源占用：1 个 PIO 状态机（15 条指令，任意 PIO 块）+ 1 个 DMA 通道 + **16 KB** 环形缓冲。
  * 注意：若扫描引擎选了 pio，两者必须使用**不同的 PIO 块**（vfd_scan 程序已占满 32 条指令）。
  */
 #ifndef VFD_SSD1306_SLAVE_RP2040_H
@@ -30,7 +30,8 @@ namespace vfd {
  * 时突发长度就超过 1 KB，而 CPU 还要同时干活（渲染、串口打印）。旧值 256 字（1 KB）在
  * CPU 一次轮询/打印之间就会被 DMA 跑满好几圈，配合"写地址 mod N 差分"的计数方式，
  * 整圈的字会被**静默丢弃**（现场：1024 B 只收到 256 B，部分 GDDRAM 不更新）。
- * 现在 16 KB 能装下 15 帧数据（或 4 帧 × 命令），且计数改成精确的"整圈 + 圈内偏移"。 */
+ * 现在 16 KB = 4096 字，而一屏（水平寻址整屏）= 1024 字 ⇒ 能**整装 4 屏**；
+ * 计数也改成了精确的"基数 + 连续搬运差分"（见 ssd1306_pio_wire.h 的 ringWrittenFromBase）。 */
 constexpr uint32_t SSD1306_SLAVE_RING_WORDS = 4096;
 
 /* ---- 默认接线（可在 CMake 里用 -DVFD_EMU_PIN_xxx=n 覆盖）---- */
@@ -122,11 +123,39 @@ public:
     bool resetAsserted() const { return _resetAsserted; }
     /* RESET 引脚由低变高的那次事件（应用应据此复位模拟器状态） */
     bool consumeResetEvent();
+
+    /* ---- 事务间隔直方图（**只观测、零行为影响**）----
+     * 目的：为 CS 边界重同步的去抖窗口提供**实测依据**。必须分清两类间隔：
+     *   · 同一逻辑操作内背靠背的事务（u8g2 整帧 sendBuffer 时每个 tile 一个事务）；
+     *   · 两次独立操作之间（例如 init 序列与随后的第一帧之间）。
+     * 去抖窗口必须**大于前者、小于后者**，否则会把一条逻辑操作切碎、误丢参数。
+     * 桶（µs）见 txnGapBucketLabel()。 */
+    static constexpr int TXN_GAP_BUCKETS = 12;
+    uint32_t txnCount() const { return _txnCount; }
+    uint32_t txnGapBucket(int i) const
+    {
+        return (i >= 0 && i < TXN_GAP_BUCKETS) ? _txnGap[i] : 0u;
+    }
+    static const char *txnGapBucketLabel(int i);
+
+    /* ---- 事务边界（CS 释放 + 空闲去抖）----
+     * PIO 侧知道事务边界却没交给模拟器；而一条命令是"命令字节 + 若干参数字节"的多字节序列，
+     * 少一个字节就会把下一条命令吃成参数、且**永不自行纠正** —— 现场症状正是"unknown 持续
+     * 增长、gdram_crc 永不匹配、只能 RESET 恢复"。
+     * 这里用**纯 CPU 侧**办法补回边界（不动时序关键的 PIO 程序）：
+     *   · CS 抬升并空闲满 CS_IDLE_DEBOUNCE_US ⇒ 置一次事务结束标志；
+     *   · 应用在**把环形缓冲排空之后**调 consumeTransactionEnd()；
+     *   · 模拟器据此作废"没来得及收齐参数"的那条命令，下一事务重新对齐。
+     * ⚠️ 调用约定：必须在 popByte() 返回 false（排空）之后调用。 */
+    bool consumeTransactionEnd();
+    uint32_t transactionEndCount() const { return _txnEnds; }
     uint32_t pendingWords() const { return static_cast<uint32_t>(_pending < 0 ? 0 : _pending); }
     /* DMA 已搬满的整圈数（累计写入量 = laps*N + (N - remaining)，诊断用） */
     uint32_t lapCount() const { return _laps; }
-    /* PIO 是否因为 RX FIFO 满而卡住（DMA 跟不上时会置位，正常应为 false） */
-    bool stalled() const;
+    /* PIO 是否因为 RX FIFO 满而卡住（DMA 跟不上时会置位，正常应为 false）。
+     * ⚠️ FDEBUG 的 RXSTALL 是**粘性**位：本函数**读取即清除**，所以它回答的是
+     *    "自上次询问以来是否卡过"，而不是"此刻是否卡着"。正因如此它不能是 const。 */
+    bool stalled();
 
 private:
     void updatePending();
@@ -156,6 +185,14 @@ private:
     uint32_t _resetEvents;
     bool _resetAsserted;
     bool _pendingResetEvent;
+    /* 事务观测（诊断，不参与任何判定） */
+    uint32_t _txnCount;
+    uint32_t _txnGap[TXN_GAP_BUCKETS];
+    uint32_t _csIdleSinceUs;
+    bool _csIdleLast;
+    bool _txnSeen;
+    uint32_t _txnEnds;
+    bool _pendingTxnEnd;
     bool _running;
     const char *_error;
 };

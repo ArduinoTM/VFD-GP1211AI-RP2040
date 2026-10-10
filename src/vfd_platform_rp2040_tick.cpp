@@ -40,8 +40,12 @@ static inline void __not_in_flash_func(vfdStrobe)(uint8_t pin)
 /* LAT 锁存脉冲：先把 LAT 拉到**有效电平**并保持 ≥1 µs，再回到空闲电平。
  * 有效电平 = 高（驱动电路里没有反相器，MCU 直连 LATa/LATg）：
  * MCU 直连 LATa/LATg，所以必须发**正脉冲**（见 vfd_platform_rp2040.h / vfd_scan_pio_bits.h）。
- * ⚠️ 锁存发生在"进入有效电平"的那个沿 ⇒ 本函数必须**先于** CLKg 的 vfdStrobe() 调用，
- *    与 PIO 引擎的 `set pins 0x1 → 0x2` 一致：先锁存上一扫描移入的图案，再前进一格。 */
+ * ⚠️ 锁存发生在"进入有效电平"的那个沿 ⇒ 边界顺序是**先前进、再锁存**：
+ *    本函数必须在 CLKg 的前进沿（vfdStrobe()）**之后**调用，锁到的才是前进后的栅极对。
+ *    与 PIO 引擎逐条对应：`set pins 0x0`（CLKg↓）→ `0x2`（CLKg↑ 前进）→ `0x3`（LAT↑ 锁存）
+ *    → `0x2`（LAT↓ 释放），见 src/vfd_scan.pio。
+ *    ⚠️ 写反（先锁存、后前进）会锁到"前进之前"的栅极对 ⇒ 画面整体水平平移 3 列 ——
+ *       这是项目历史上真实踩过的坑（tick 曾与 PIO 差 dx = −3）。 */
 static inline void __not_in_flash_func(vfdLatPulse)(uint8_t pin)
 {
     const uint32_t active = 1, idle = 0; /* 高有效：正脉冲锁存，空闲低 */

@@ -23,13 +23,49 @@ constexpr uint32_t RING_MASK = SSD1306_SLAVE_RING_WORDS - 1u;
  *
  * 现在的取舍：**DMA 连续搬运（绝不停在半路）**，而计数精度由"起始计数 − remaining" + `_base`
  * 保证（见 updatePending()）；计数快用完时只在**总线空闲**（无在途数据）时补满（见 task()）。 */
+/* 事务间隔分桶（µs）：<1 <2 <5 <10 <20 <50 <100 <200 <500 <1ms <5ms >=5ms */
+static int txnGapBucketOf(uint32_t us)
+{
+    if (us < 1u) return 0;
+    if (us < 2u) return 1;
+    if (us < 5u) return 2;
+    if (us < 10u) return 3;
+    if (us < 20u) return 4;
+    if (us < 50u) return 5;
+    if (us < 100u) return 6;
+    if (us < 200u) return 7;
+    if (us < 500u) return 8;
+    if (us < 1000u) return 9;
+    if (us < 5000u) return 10;
+    return 11;
+}
+
 constexpr uint32_t DMA_COUNT_FULL = 0xFFFFFFFFu;
 constexpr uint32_t DMA_COUNT_TOPUP = 0x40000000u;
+
+/* CS 边界重同步的去抖窗口：CS 抬升后空闲满这么久，才判定一次 SPI 事务结束。
+ * 取值**由实测定**（2026-10-11 事务间隔直方图，u8g2 主控）：
+ *   操作内背靠背事务 ≤100 µs（<5µs×12, <20µs×7, <50×1, <100×1），
+ *   操作之间 ≥5 ms（7 次），100 µs–5 ms 区间**零样本**（干净的空谷）。
+ * 取 500 µs：比谷底高 5×、比谷顶低 10×，两边都不误伤。
+ * ⚠️ 真 SSD1306 对"命令与参数之间停顿多久"没有限制，所以去抖越长越不误伤"把一条命令
+ *    拆成多次事务发"的主机；代价只是丢字节后自恢复变慢。需要时调大此值。 */
+constexpr uint32_t CS_IDLE_DEBOUNCE_US = 500u;
 
 /* PINCTRL / EXECCTRL 里两个引脚字段的位置（RP2040 数据手册 3.7） */
 constexpr uint32_t PINCTRL_IN_BASE_LSB = 15;
 constexpr uint32_t EXECCTRL_JMP_PIN_LSB = 24;
 } // namespace
+
+/* 事务间隔分桶的标签（成员函数定义必须落在 namespace vfd 内、匿名 namespace 之外） */
+const char *Ssd1306SpiSlave::txnGapBucketLabel(int i)
+{
+    static const char *kLabels[TXN_GAP_BUCKETS] = {
+        "<1", "<2", "<5", "<10", "<20", "<50",
+        "<100", "<200", "<500", "<1m", "<5m", ">=5m"
+    };
+    return (i >= 0 && i < TXN_GAP_BUCKETS) ? kLabels[i] : "?";
+}
 
 /* 环形缓冲的定义（见头文件注释：16 KB 对齐不能放在对象里，否则 sizeof 被撑到 48 KB） */
 alignas(SSD1306_SLAVE_RING_WORDS * 4) uint32_t Ssd1306SpiSlave::_ring[SSD1306_SLAVE_RING_WORDS];
@@ -63,9 +99,16 @@ Ssd1306SpiSlave::Ssd1306SpiSlave(const Ssd1306SpiSlaveConfig &cfg)
     , _resetEvents(0)
     , _resetAsserted(false)
     , _pendingResetEvent(false)
+    , _txnCount(0)
+    , _csIdleSinceUs(0)
+    , _csIdleLast(true)
+    , _txnSeen(false)
+    , _txnEnds(0)
+    , _pendingTxnEnd(false)
     , _running(false)
     , _error("")
 {
+    memset(_txnGap, 0, sizeof(_txnGap));
     memset(_words, 0, sizeof(_words));
     memset(_ring, 0, sizeof(_ring));
 }
@@ -300,6 +343,27 @@ void __not_in_flash_func(Ssd1306SpiSlave::task)()
 
     updatePending();
 
+    /* ---- 事务观测：CS 低 = 事务进行中；CS 抬 = 空闲开始。只记时间，不改变任何行为。 ---- */
+    {
+        const bool idle = gpio_get(_cfg.pin_cs) != 0;
+        if (!idle && _csIdleLast) { /* CS 刚落：新事务开始 */
+            if (_txnSeen)
+                _txnGap[txnGapBucketOf(time_us_32() - _csIdleSinceUs)]++;
+            _txnSeen = true;
+            _txnCount++;
+            _pendingTxnEnd = false; /* 新事务开始：撤销上一个尚未被消费的边界 */
+        } else if (idle && !_csIdleLast) { /* CS 刚抬：事务结束，记空闲起点 */
+            _csIdleSinceUs = time_us_32();
+        }
+        /* 空闲满去抖 ⇒ 判定一次事务结束（去抖值由实测分布确定，见文件头常量注释） */
+        if (idle && !_pendingTxnEnd
+            && (time_us_32() - _csIdleSinceUs) >= CS_IDLE_DEBOUNCE_US) {
+            _pendingTxnEnd = true;
+            _txnEnds++;
+        }
+        _csIdleLast = idle;
+    }
+
     /* RESET 引脚（低有效）：由低变高的时刻通知应用复位模拟器状态 */
     if (_cfg.pin_reset != 0xFF) {
         const bool asserted = gpio_get(_cfg.pin_reset) == 0;
@@ -333,11 +397,26 @@ bool Ssd1306SpiSlave::consumeResetEvent()
     return e;
 }
 
-bool Ssd1306SpiSlave::stalled() const
+bool Ssd1306SpiSlave::consumeTransactionEnd()
 {
-    /* FDEBUG 的 RXSTALL 位（SM 因 RX FIFO 满而卡住） */
+    /* 双重确认：既要有"已去抖的空闲"标志，此刻引脚也确实处于未选中。
+     * 排空由调用方保证（它在 popByte() 返回 false 之后才调这里）。 */
+    if (!_pendingTxnEnd || gpio_get(_cfg.pin_cs) == 0)
+        return false;
+    _pendingTxnEnd = false;
+    return true;
+}
+
+bool Ssd1306SpiSlave::stalled()
+{
+    /* FDEBUG 的 RXSTALL 位（SM 因 RX FIFO 满而卡住）。
+     * 这是**粘性**标志：一旦置位就一直是 1，而它又是验收判据，所以这里写 1 清除，
+     * 让返回值表示"自上次询问以来是否卡过"，避免给出永久为真的错误结论。 */
     const uint32_t bit = 1u << (PIO_FDEBUG_RXSTALL_LSB + _cfg.sm);
-    return (_cfg.pio->fdebug & bit) != 0;
+    const bool set = (_cfg.pio->fdebug & bit) != 0;
+    if (set)
+        _cfg.pio->fdebug = bit; /* 写 1 清除 */
+    return set;
 }
 
 } /* namespace vfd */

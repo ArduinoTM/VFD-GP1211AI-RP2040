@@ -220,7 +220,6 @@ void VFD_GP1211AI::display()
 {
     waitForFrameBoundary();
 
-
     uint8_t *dst = _frameBuffer[_writeIndex];
     vfd::packFrame(_framebuffer, _invert, dst);
     vfd::wirePrepareFrame(dst, _platform.wireReversesByteBits());

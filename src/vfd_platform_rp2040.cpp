@@ -101,8 +101,6 @@ Rp2040Platform::Rp2040Platform(const Rp2040Config &cfg)
     , _dmaConfig(dma_channel_get_default_config(static_cast<uint>(cfg.dma_ch < 0 ? 0 : cfg.dma_ch)))
     , _pioClkHz(0)
     , _guardMarginUs(0)
-    , _seedRaiseAlarm(-1)
-    , _seedLowerAlarm(-1)
 #else
     , _timerRunning(false)
     , _spiBaudrate(0)

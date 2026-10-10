@@ -41,8 +41,11 @@ void Ssd1306Emulator::reset()
     _startLine = 0;
     _multiplex = SSD1306_HEIGHT - 1;
 
+    memset(_cmdSeen, 0, sizeof(_cmdSeen));
+    memset(_paramSeen, 0, sizeof(_paramSeen));
     _commandCount = 0;
     _dataCount = 0;
+    _resyncCount = 0;
     _unknownCount = 0;
     _lastCommand = 0;
 
@@ -103,8 +106,27 @@ void Ssd1306Emulator::pushByte(uint8_t value, bool dc)
         handleCommand(value);
 }
 
+void Ssd1306Emulator::endTransaction()
+{
+    /* 只作废"没收齐参数"的那条命令。已收齐并 apply 过的命令、以及数据字节都不受影响 ——
+     * 与真 SSD1306 在 CS 释放时"未完成的多字节命令作废"一致。
+     * ⚠️ 不要在这里复位寻址模式/写指针：它们是显示器的持久状态，真机也不会因一次 CS 释放改变。 */
+    if (_pendingParams != 0) {
+        _pendingParams = 0;
+        _pendingGot = 0;
+        _resyncCount++;
+    }
+}
+
 void Ssd1306Emulator::handleCommand(uint8_t cmd)
 {
+    /* 诊断位图：把"这个 DC=0 字节到底被当成命令还是参数"记下来（排故用，不影响行为） */
+    if (_pendingParams == 0) {
+        _cmdSeen[cmd >> 3] |= static_cast<uint8_t>(1u << (cmd & 7));
+    } else {
+        _paramSeen[cmd >> 3] |= static_cast<uint8_t>(1u << (cmd & 7));
+    }
+
     _commandCount++;
     _lastCommand = cmd;
 

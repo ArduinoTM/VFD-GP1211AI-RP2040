@@ -68,6 +68,14 @@ public:
     /* 送入一个字节；dc=false 表示命令（DC 低），true 表示数据（DC 高） */
     void pushByte(uint8_t value, bool dc);
 
+    /* SPI 事务结束（CS 释放并空闲去抖后）调用：**作废没收齐参数的那条命令**，
+     * 从下一个事务重新对齐。命令是"命令字节 + 若干参数字节"的多字节序列，丢一个字节就会让
+     * 参数收集器永久错位（症状：unknown 持续增长、gdram_crc 永不匹配、只能 RESET 恢复）。
+     * 有了这个边界，最坏只损失当前这一条命令，下一事务自动恢复。
+     * 只在"确实有未收齐的参数"时计数（resyncCount），无待收参数时是空操作。 */
+    void endTransaction();
+    uint32_t resyncCount() const { return _resyncCount; }
+
     /* 主循环周期调用：按时间推进滚动（滚动活跃时每个间隔步改写一次 GDDRAM）。
      * 时间基准：1 "SSD1306 帧" = 8 ms（本机 VFD 123 Hz 帧周期）。 */
     void tick(uint32_t nowMs);
@@ -84,6 +92,8 @@ public:
     uint32_t gdramCrc32() const;
     bool dirty() const { return _dirty; }
     void clearDirty() { _dirty = false; }
+    /* 重新置脏：shouldRender() 已经消费掉的"有改动"需要退回时用（见 main.cpp 双核丢帧分支） */
+    void markDirty() { _dirty = true; }
 
     bool displayOn() const { return _displayOn; }
     bool entireDisplayOn() const { return _entireOn; }
@@ -100,6 +110,20 @@ public:
 
     uint32_t commandCount() const { return _commandCount; }
     uint32_t dataCount() const { return _dataCount; }
+
+    /* ---- 诊断：DC=0 字节的"去向"位图（排故用，不改变任何行为）----
+     * 命令与参数都以 DC=0 传输，光看计数分不清"某个字节到底有没有到"。
+     * 这两张 256 位位图分别回答：
+     *   sawAsCommand(b) —— b 曾被当作**新命令**收下（当时没有待收参数）；
+     *   sawAsParam(b)   —— b 曾被当作**上一条命令的参数**吃掉。
+     * 例：主机发了 0xAF 却不亮 ⇒
+     *   sawAsCommand(0xAF)==false && sawAsParam(0xAF)==false ⇒ 这个字节压根没到；
+     *   sawAsCommand(0xAF)==false && sawAsParam(0xAF)==true  ⇒ 到了，但被当成参数吃了
+     *                                                            （解析错位/丢字节）。 */
+    static constexpr int SEEN_BITMAP_BYTES = 32;
+    bool sawAsCommand(uint8_t b) const { return (_cmdSeen[b >> 3] & (1u << (b & 7))) != 0; }
+    bool sawAsParam(uint8_t b) const { return (_paramSeen[b >> 3] & (1u << (b & 7))) != 0; }
+
     uint32_t unknownCommandCount() const { return _unknownCount; }
     uint8_t lastCommand() const { return _lastCommand; }
 
@@ -137,6 +161,9 @@ private:
     void scrollHorizontal(bool right);    /* 页窗口内每页整体平移 1 列（循环） */
     void scrollVertical(uint8_t rows);    /* 页窗口内整体下移 rows 行（循环） */
 
+    static_assert(SSD1306_GDDRAM_SIZE == SSD1306_WIDTH * (SSD1306_HEIGHT / 8),
+        "GDDRAM 必须正好是 宽 × 高/8 字节（页式布局）");
+
     uint8_t _gdram[SSD1306_GDDRAM_SIZE];
 
     /* 寻址与窗口 */
@@ -145,11 +172,16 @@ private:
     uint8_t _colStart, _colEnd;   /* 0x21 设置的列窗口 */
     uint8_t _pageStart, _pageEnd; /* 0x22 设置的页窗口 */
 
+    /* 诊断位图：哪些字节曾以 DC=0 被当作"新命令"/"参数"收下（排故用，不改变任何行为） */
+    uint8_t _cmdSeen[SEEN_BITMAP_BYTES];
+    uint8_t _paramSeen[SEEN_BITMAP_BYTES];
+
     /* 多字节命令解析（参数最多 6 个：滚动设置命令） */
     uint8_t _pendingCmd;
     uint8_t _pendingParams;
     uint8_t _pendingGot;
     uint8_t _params[6];
+    uint32_t _resyncCount; /* 因事务边界而作废半条命令的次数（诊断，正常应为 0） */
 
     /* 显示配置 */
     bool _displayOn;

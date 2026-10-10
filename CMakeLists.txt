@@ -188,3 +188,20 @@ foreach(opt IN LISTS VFD_PIN_OPTIONS)
         message(STATUS "引脚覆盖: ${opt}=${${opt}}")
     endif()
 endforeach()
+
+# ---------------------------------------------------------------------------
+# 宿主测试接入 CTest：一条 `ctest` 跑完所有"不需要硬件"的回归。
+# 真正的构建/运行逻辑仍在 tests/run_host_tests.ps1 里 —— CI 与本地共用同一个入口，
+# 避免"两套测试脚本各跑各的"。
+# 注：本工程配置需要 Pico SDK（固件目标），但测试本身不需要硬件。
+# ---------------------------------------------------------------------------
+enable_testing()
+find_program(VFD_PWSH_EXE NAMES pwsh powershell)
+if(VFD_PWSH_EXE)
+    add_test(NAME host_tests
+        COMMAND ${VFD_PWSH_EXE} -NoProfile -ExecutionPolicy Bypass -File
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_host_tests.ps1)
+    set_tests_properties(host_tests PROPERTIES TIMEOUT 900)
+else()
+    message(STATUS "未找到 pwsh/powershell ⇒ 不注册 host_tests（可手动跑 tests/run_host_tests.ps1）")
+endif()

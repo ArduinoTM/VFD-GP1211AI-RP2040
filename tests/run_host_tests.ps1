@@ -116,7 +116,8 @@ $inoStub = @("-I$(Join-Path $PSScriptRoot 'host_syntax/stub_arduino')")
 $inoTargets = @(
     'examples/pico2_full_test/pico2_full_test.ino',
     'examples/pico2_u8g2_test/pico2_u8g2_test.ino',
-    'examples/pico2_bitbang_wiring_test/pico2_bitbang_wiring_test.ino'
+    'examples/pico2_bitbang_wiring_test/pico2_bitbang_wiring_test.ino',
+    'examples/due_full_test/due_full_test.ino'              # Arduino Due 移植版（SPI 只在 ICSP 排针上）
 )
 foreach ($ino in $inoTargets) {
     Write-Host "语法检查(Arduino 桩): $ino" -ForegroundColor DarkGray

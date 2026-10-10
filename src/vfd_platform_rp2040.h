@@ -4,7 +4,7 @@
  * 提供两种可选扫描引擎（编译期二选一，见 CMake 选项 VFD_SCAN_ENGINE）：
  *
  * ┌ VFD_SCAN_ENGINE=tick（默认）—— "定时器 + SPI + DMA"
- * │   CLKa/SIa : SPI0（MODE3 + LSB-first，4.46 MHz ≤ 手册 fCLK 上限 5 MHz）
+ * │   CLKa/SIa : SPI0（MODE3 + LSB-first，4.500 MHz ≤ 手册 fCLK 上限 5 MHz）
  * │   阳极数据 : DMA 从帧缓冲搬到 SPI TX FIFO（TX DREQ 节流）
  * │   RX FIFO  : 第二个 DMA 通道持续丢弃（PL022 在 RX FIFO 满时不再发起传输）
  * │   LAT/CLKg/SIg : GPIO 软件翻转（在 repeating_timer 中断里，函数放 RAM）
@@ -229,14 +229,11 @@ private:
     dma_channel_config _dmaConfig;
     uint32_t _pioClkHz;    /* 实际 CLKa 频率 */
     uint32_t _guardMarginUs;
-    alarm_id_t _seedRaiseAlarm;      /* 帧首扫描内拉高请求脚 */
-    alarm_id_t _seedLowerAlarm;      /* 稍后撤掉请求脚 */
+
     uint32_t _blankFrame[vfd::FRAME_SIZE / 4]; /* _published 为空时的占位帧（48 字节/扫描 布局） */
     static Rp2040Platform *_instance;          /* 中断里需要实例指针 */
     static void dmaIrqThunk();
-    static int64_t seedRaiseThunk(alarm_id_t id, void *user_data);
-    static int64_t seedLowerThunk(alarm_id_t id, void *user_data);
-    void cancelSeedRequest();
+
     void onFrameDmaDone();
     void seedGrid();
     void patchProgramPins(uint16_t *words, uint length);

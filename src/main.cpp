@@ -366,6 +366,13 @@ static void runSsd1306EmulatorLoop(VFD_GP1211AI &display, vfd::Rp2040Platform &p
 #endif
         while (slave.popByte(value, dc))
             emu.pushByte(value, dc);
+
+        /* 环形缓冲已排空 + CS 已释放并空闲去抖 ⇒ 一次 SPI 事务结束。
+         * 让模拟器作废"没来得及收齐参数"的那条命令，从下一事务重新对齐 ——
+         * 这样丢一个字节最多损失一条命令，而不是永久错位（见 ssd1306_slave_rp2040.h）。
+         * ⚠️ 必须在排空之后调用。 */
+        if (slave.consumeTransactionEnd())
+            emu.endTransaction();
 #if VFD_DEBUG_DIAG
         core0DrainUs += time_us_32() - drainT0; /* 排水 + 解码 */
 #endif
@@ -409,14 +416,52 @@ static void runSsd1306EmulatorLoop(VFD_GP1211AI &display, vfd::Rp2040Platform &p
                 static_cast<unsigned long>(cmds), static_cast<unsigned long>(cmds - commandsAtStats),
                 static_cast<unsigned long>(data), static_cast<unsigned long>(data - dataAtStats),
                 static_cast<unsigned long>(emu.unknownCommandCount()));
-            printChunked(slave, emu, true, "         overrun=%lu(+%lu)   drop=%lu(+%lu)   stall=%d   disp=%d   contrast=%u   gdram_crc=0x%08lx\n",
+            printChunked(slave, emu, true, "         overrun=%lu(+%lu)   drop=%lu(+%lu)   resync=%lu   stall=%d   disp=%d   contrast=%u   gdram_crc=0x%08lx\n",
                 static_cast<unsigned long>(slave.overrunCount()),
                 static_cast<unsigned long>(slave.overrunCount() - overrunsAtStats),
                 static_cast<unsigned long>(slave.droppedCount()),
                 static_cast<unsigned long>(slave.droppedCount() - droppedAtStats),
+                static_cast<unsigned long>(emu.resyncCount()), /* 真正作废半条命令的次数 */
                 slave.stalled() ? 1 : 0, emu.displayOn() ? 1 : 0,
                 static_cast<unsigned>(emu.contrast()),
                 static_cast<unsigned long>(emu.gdramCrc32())); /* 与主控测试程序打印的图像 CRC 对照 */
+            /* ---- 排故：把"哪些 DC=0 字节被当成命令收下 / 被当成参数吃掉"两张位图打出来。
+             * 判读：主机发了某条命令但画面没反应时，先看这个字节出现在哪一张里 ——
+             *   两张都没有 ⇒ 该字节压根没到（主机侧/接线/DC 线）；
+             *   只在参数那张里 ⇒ 到了但被当前命令当参数吃了（解析错位，通常是丢了/多了字节）。 */
+            {
+                char line[200];
+                int n = snprintf(line, sizeof(line), "TRACE    cmdSeen:");
+                for (int b = 0; b < 256; ++b)
+                    if (emu.sawAsCommand(static_cast<uint8_t>(b)) && n < (int)sizeof(line) - 6)
+                        n += snprintf(line + n, sizeof(line) - n, " %02X", b);
+                diagWrite(line, (size_t)n);
+                n = snprintf(line, sizeof(line), "\n         paramSeen:");
+                for (int b = 0; b < 256; ++b)
+                    if (emu.sawAsParam(static_cast<uint8_t>(b)) && n < (int)sizeof(line) - 6)
+                        n += snprintf(line + n, sizeof(line) - n, " %02X", b);
+                n += snprintf(line + n, sizeof(line) - n, "\n");
+                diagWrite(line, (size_t)n);
+                diagFlush();
+            }
+            /* ---- 事务间隔直方图：为"CS 边界重同步"的去抖窗口提供实测依据。
+             * 判读：若绝大多数间隔落在 <1/<2/<5 µs（u8g2 背靠背的 tile 事务），
+             * 而另有一撮落在数百 µs ~ ms（两次独立操作之间），去抖就取两者之间。 */
+            {
+                char line[200];
+                int n = snprintf(line, sizeof(line), "TXN      n=%lu  gaps:",
+                    static_cast<unsigned long>(slave.txnCount()));
+                for (int i = 0; i < vfd::Ssd1306SpiSlave::TXN_GAP_BUCKETS; ++i) {
+                    const uint32_t c = slave.txnGapBucket(i);
+                    if (c != 0 && n < (int)sizeof(line) - 16)
+                        n += snprintf(line + n, sizeof(line) - n, " %s=%lu",
+                            vfd::Ssd1306SpiSlave::txnGapBucketLabel(i),
+                            static_cast<unsigned long>(c));
+                }
+                n += snprintf(line + n, sizeof(line) - n, "\n");
+                diagWrite(line, (size_t)n);
+                diagFlush();
+            }
             printChunked(slave, emu, true, "         scroll: active=%d mode=%d %s pages=%u-%u interval=%u(%lu ms/step) v=%u steps=%lu\n",
                 emu.scrollActive() ? 1 : 0, static_cast<int>(emu.scrollMode()),
                 emu.scrollRight() ? "right" : "left",
@@ -588,6 +633,13 @@ static void __not_in_flash_func(core1Ssd1306DataPlane)()
 #endif
         while (slave.popByte(value, dc))
             emu.pushByte(value, dc);
+
+        /* 环形缓冲已排空 + CS 已释放并空闲去抖 ⇒ 一次 SPI 事务结束。
+         * 让模拟器作废"没来得及收齐参数"的那条命令，从下一事务重新对齐 ——
+         * 这样丢一个字节最多损失一条命令，而不是永久错位（见 ssd1306_slave_rp2040.h）。
+         * ⚠️ 必须在排空之后调用。 */
+        if (slave.consumeTransactionEnd())
+            emu.endTransaction();
 #if VFD_DEBUG_DIAG
         gCore1DrainUs += time_us_32() - drainT0; /* 排水 + 解码 */
 #endif
@@ -615,6 +667,11 @@ static void __not_in_flash_func(core1Ssd1306DataPlane)()
 #endif
                 __dmb(); /* 槽数据写完才允许 seq 变化可见 */
                 gHandoff.seq = seq + 1u;
+            } else {
+                /* 消费者还没取走上一帧 ⇒ 本帧丢弃（宁丢帧、不撕裂）。
+                 * ⚠️ 但 shouldRender() 已经把 _dirty 清掉了：若主机此后再不发数据，
+                 *    这次改动就永远不会上屏（静默丢最后一帧）。重新置脏，下一轮再试。 */
+                emu.markDirty();
             }
         }
 
@@ -736,14 +793,48 @@ static void runSsd1306EmulatorLoopDualCore(VFD_GP1211AI &display, vfd::Rp2040Pla
                 static_cast<unsigned long>(cmds), static_cast<unsigned long>(cmds - commandsAtStats),
                 static_cast<unsigned long>(data), static_cast<unsigned long>(data - dataAtStats),
                 static_cast<unsigned long>(emu.unknownCommandCount()));
-            printChunked(slave, emu, false, "         overrun=%lu(+%lu)   drop=%lu(+%lu)   stall=%d   disp=%d   contrast=%u   gdram_crc=0x%08lx\n",
+            printChunked(slave, emu, false, "         overrun=%lu(+%lu)   drop=%lu(+%lu)   resync=%lu   stall=%d   disp=%d   contrast=%u   gdram_crc=0x%08lx\n",
                 static_cast<unsigned long>(slave.overrunCount()),
                 static_cast<unsigned long>(slave.overrunCount() - overrunsAtStats),
                 static_cast<unsigned long>(slave.droppedCount()),
                 static_cast<unsigned long>(slave.droppedCount() - droppedAtStats),
+                static_cast<unsigned long>(emu.resyncCount()), /* 真正作废半条命令的次数 */
                 slave.stalled() ? 1 : 0, emu.displayOn() ? 1 : 0,
                 static_cast<unsigned>(emu.contrast()),
                 static_cast<unsigned long>(emu.gdramCrc32()));
+            { /* 排故位图，含义见单核分支同处注释 */
+                char line[200];
+                int n = snprintf(line, sizeof(line), "TRACE    cmdSeen:");
+                for (int b = 0; b < 256; ++b)
+                    if (emu.sawAsCommand(static_cast<uint8_t>(b)) && n < (int)sizeof(line) - 6)
+                        n += snprintf(line + n, sizeof(line) - n, " %02X", b);
+                diagWrite(line, (size_t)n);
+                n = snprintf(line, sizeof(line), "\n         paramSeen:");
+                for (int b = 0; b < 256; ++b)
+                    if (emu.sawAsParam(static_cast<uint8_t>(b)) && n < (int)sizeof(line) - 6)
+                        n += snprintf(line + n, sizeof(line) - n, " %02X", b);
+                n += snprintf(line + n, sizeof(line) - n, "\n");
+                diagWrite(line, (size_t)n);
+                diagFlush();
+            }
+            /* ---- 事务间隔直方图：为"CS 边界重同步"的去抖窗口提供实测依据。
+             * 判读：若绝大多数间隔落在 <1/<2/<5 µs（u8g2 背靠背的 tile 事务），
+             * 而另有一撮落在数百 µs ~ ms（两次独立操作之间），去抖就取两者之间。 */
+            {
+                char line[200];
+                int n = snprintf(line, sizeof(line), "TXN      n=%lu  gaps:",
+                    static_cast<unsigned long>(slave.txnCount()));
+                for (int i = 0; i < vfd::Ssd1306SpiSlave::TXN_GAP_BUCKETS; ++i) {
+                    const uint32_t c = slave.txnGapBucket(i);
+                    if (c != 0 && n < (int)sizeof(line) - 16)
+                        n += snprintf(line + n, sizeof(line) - n, " %s=%lu",
+                            vfd::Ssd1306SpiSlave::txnGapBucketLabel(i),
+                            static_cast<unsigned long>(c));
+                }
+                n += snprintf(line + n, sizeof(line) - n, "\n");
+                diagWrite(line, (size_t)n);
+                diagFlush();
+            }
             printChunked(slave, emu, false, "         scroll: active=%d mode=%d %s pages=%u-%u interval=%u(%lu ms/step) v=%u steps=%lu\n",
                 emu.scrollActive() ? 1 : 0, static_cast<int>(emu.scrollMode()),
                 emu.scrollRight() ? "right" : "left",

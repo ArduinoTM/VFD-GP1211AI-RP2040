@@ -93,7 +93,7 @@ static void check(bool ok, const char *what, const char *detail = "")
  * 手册 Figure 3/5 画的是**面板侧** LAT（正脉冲有效）；驱动电路里没有反相器 ⇒ MCU 侧必须
  * "空闲低、高脉冲锁存"（2026-10-06 依据电路图更正）。这里直接解码 pioasm 生成的真实指令：
  *   · 只有边界那一条 set pins 把 LAT 拉高（唯一一次锁存脉冲），数据段 LAT 恒为低；
- *   · LAT 的有效沿必须在 CLKg 上升沿**之前**（先锁存"上一扫描已移入"的图案，再前进一格）；
+ *   · LAT 的有效沿必须在 CLKg 上升沿**之后**（**先前进一格、再锁存**前进后的栅极对）；
  *   · 锁存脉冲宽 4 个 SM 周期 = 444 ns ≥ 手册 tWL 300 ns；
  *   · 没有任何一条同时抬 LAT 与 CLKg（锁存与链前进不重叠）；
  *   · LAT 位固定为"高 = 锁存有效"（极性旋钮已在 2026-10-08 清理中移除）。 */
@@ -233,6 +233,24 @@ int main()
         "播种（≈15 µs）在帧首扫描的边界（t=0）之前完成 ⇒ 顺序 = 先播种、后前进");
     check(DMA_DONE_US > -SCAN_US + 3.0,
         "播种开始于最后一次扫描的边界之后（四步边界只占 ~2 µs）⇒ 不会与边界抢写引脚");
+
+    /* ---- [1] 播种窗口约束 (a)~(d)：vfd_pio_seed_timing.h 声明「测试会全部验证一遍」，
+     *          但此前 hitIn()/raiseDelayFromInterrupt() 定义了却**从未被调用** —— 一条都没断言。
+     *          窗口 = [RAISE_US, RAISE_US + HOLD_US]（相对目标帧首扫描起点 t=0）；
+     *          检查点每 SCAN_US 出现一次，帧首那个在 t = CHECK_US（≈0.22 µs）。 ---- */
+    printf("  播种窗口：raise=%+d µs, hold=%u µs, 帧首检查点 t=%+.2f µs, 扫描 %.0f µs\n",
+        static_cast<int>(PIO_SEED_RAISE_US), static_cast<unsigned>(PIO_SEED_HOLD_US), CHECK_US, SCAN_US);
+    {
+        const double t0 = PIO_SEED_RAISE_US;
+        const double t1 = PIO_SEED_RAISE_US + static_cast<double>(PIO_SEED_HOLD_US);
+        check(t0 < CHECK_US, "(a) 拉高必须早于帧首扫描的检查点");
+        check(t1 > CHECK_US, "(b) 窗口必须跨过该检查点（否则这一帧不播种）");
+        check(t1 > 0.0 && hitIn(t0, t1, -1, -1) == -1,
+            "(c) 窗口不覆盖上一次检查点（否则重复播种）");
+        check(t1 < SCAN_US + CHECK_US, "(d) 下一次检查点之前已撤掉（否则每帧多播一次 → 画面错位）");
+        check(hitIn(t0, t1) == 0, "窗口恰好命中帧首扫描（且只命中它）");
+        check(raiseDelayFromInterrupt() > 0.0, "排程延时为正：DMA 完成中断在前，拉高在后");
+    }
 
     /* [7] 位**顺序**（不是只数个数！）——2026-10-05 实物照片定位出的 bug：
      *     链方向是 SIg → 48 47 … 1，先进链的位走得更远（链号更小）。

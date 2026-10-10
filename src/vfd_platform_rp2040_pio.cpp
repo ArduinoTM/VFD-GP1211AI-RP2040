@@ -10,7 +10,8 @@
  *
  * 时序（SM 时钟 = 2 × CLKa；默认 CLKa = 4.5 MHz → SM 9 MHz，周期 111 ns）：
  *   PWM wrap → BK 变高（消隐）→ PIO 的 `wait 1 pin BK` 立即通过 → 开始移位
- *   48 字节 × 17 周期 + 边界 6 周期 ≈ 824 周期 ≈ 91.6 µs（帧末再 + 34 周期播种 ≈ 3.8 µs）
+ *   802 周期 ≈ 89.1 µs（= 两个 wait 2 + 边界四步 16 + set y 1 + 3 组×(set x 1 + 16 字节×16) 771
+ *                     + 组循环 [3] 12）；播种已改由 CPU 在帧末翻引脚，程序内无额外开销
  *   → 100 µs 时 BK 变低开始点亮，189 µs 进入下一扫描。
  *
  * 说明：PIO 读取 BK 引脚需要该 pad 的输入缓冲使能（gpio_set_input_enabled）。
@@ -181,7 +182,6 @@ void Rp2040Platform::engineInit()
     if (checkUs >= _cfg.scan_period_us
         || static_cast<int32_t>(PIO_SEED_RAISE_US) > 0
         || (PIO_SEED_RAISE_US + static_cast<int32_t>(PIO_SEED_HOLD_US)) <= static_cast<int32_t>(checkUs)
-        || (PIO_SEED_RAISE_US + PIO_SEED_HOLD_US) <= checkUs
         || (PIO_SEED_RAISE_US + PIO_SEED_HOLD_US) >= nextCheckUs) {
         _engineError = true;
     }
@@ -210,7 +210,6 @@ void Rp2040Platform::engineStart()
 
 void Rp2040Platform::engineStop()
 {
-    cancelSeedRequest(); /* 撤掉可能还在排队的播种闹钟，并让请求脚回到低 */
     pio_sm_set_enabled(_cfg.pio, _cfg.sm, false);
     dma_channel_abort(static_cast<uint>(_cfg.dma_ch));
 }
@@ -239,7 +238,11 @@ void Rp2040Platform::engineDeinit()
  *    早先这里把 LAT 也抬高了（照 Note 15 的"LATg 常高"），一旦播种时刻落进点亮窗口，
  *    栅极链的搬动会**可见**地显示出来 —— 实机症状正是"最右 3 列闪烁、上半部线框左右抖动"。
  *    （tick 引擎的内联播种一直是保持 LAT 低的，所以它没有这个现象。） */
-void Rp2040Platform::seedGrid()
+/* ⚠️ 必须与调用者 onFrameDmaDone() 一样放 RAM：它在**帧完成中断里**被调用（123 Hz）。
+ *    若留在 Flash，一旦同期有 XIP 争用（双核、擦写、大量取指），中断延迟会被放大 ——
+ *    这与本文件其它中断路径（dmaIrqThunk / onFrameDmaDone / 三个 thunk）的约定一致。
+ *    nm 核对：修复前 seedGrid 在 0x10004xxx（Flash），修复后在 0x2000xxxx（RAM）。 */
+void __not_in_flash_func(Rp2040Platform::seedGrid)()
 {
     const uint32_t lat = 1u << _cfg.pin_lat;
     const uint32_t clkg = 1u << _cfg.pin_clkg;
@@ -267,7 +270,6 @@ void Rp2040Platform::seedGrid()
     }
     /* 最后一个 CLKg 上升沿（第 5 个脉冲）之后，SIg 已为 0；此处再等一拍，
      * 顺便把请求脚状态复位 */
-    cancelSeedRequest();
 }
 
 /* -------------------------------------------------------------- 帧完成中断 */
@@ -276,33 +278,6 @@ void __not_in_flash_func(Rp2040Platform::dmaIrqThunk)()
 {
     if (_instance != nullptr)
         _instance->onFrameDmaDone();
-}
-
-/* 帧首扫描内拉高播种请求脚（由定时器闹钟在 wrap + PIO_SEED_RAISE_US 触发） */
-int64_t __not_in_flash_func(Rp2040Platform::seedRaiseThunk)(alarm_id_t id, void *user_data)
-{
-    (void)id;
-    Rp2040Platform *self = static_cast<Rp2040Platform *>(user_data);
-    if (self == nullptr)
-        return 0;
-
-    self->_seedRaiseAlarm = -1;
-    /* 保持到跨过本扫描周期的 `jmp pin` 检查点，并在下一次检查点之前撤掉 */
-    self->_seedLowerAlarm = add_alarm_in_us(PIO_SEED_HOLD_US,
-        &Rp2040Platform::seedLowerThunk, self, true);
-    return 0;
-}
-
-/* 撤掉播种请求脚 */
-int64_t __not_in_flash_func(Rp2040Platform::seedLowerThunk)(alarm_id_t id, void *user_data)
-{
-    (void)id;
-    Rp2040Platform *self = static_cast<Rp2040Platform *>(user_data);
-    if (self == nullptr)
-        return 0;
-
-    self->_seedLowerAlarm = -1;
-    return 0;
 }
 
 /* 预约"帧首扫描"的播种请求。
@@ -320,19 +295,12 @@ int64_t __not_in_flash_func(Rp2040Platform::seedLowerThunk)(alarm_id_t id, void 
  * 使请求脚**恰好跨过帧首扫描的那一次检查**：
  *   · 早于上一次检查（第 43 次扫描）结束 ⇒ 不会播到错误扫描；
  *   · 晚于下一次检查（帧首 + 189 µs）开始 ⇒ 不会重复播种。
- * 容差：两侧各 ≈±60 µs（闹钟用 1 MHz 计时器，抖动 µs 级）——见 tests/test_pio_seed_timing.cpp。 */
-
-void __not_in_flash_func(Rp2040Platform::cancelSeedRequest)()
-{
-    if (_seedRaiseAlarm >= 0) {
-        cancel_alarm(_seedRaiseAlarm);
-        _seedRaiseAlarm = -1;
-    }
-    if (_seedLowerAlarm >= 0) {
-        cancel_alarm(_seedLowerAlarm);
-        _seedLowerAlarm = -1;
-    }
-}
+ * 容差：两侧各 ≈±60 µs（闹钟用 1 MHz 计时器，抖动 µs 级）——见 tests/test_pio_seed_timing.cpp。
+ *
+ * ⚠️ 2026-10-11 清理：这套"请求脚 + 定时器闹钟"方案**已彻底移除**（PIO 程序里不再有 `jmp pin`、
+ *    源码里也不存在请求脚配置），帧首播种现在完全由 CPU 在帧末 DMA 完成中断里调 seedGrid()
+ *    直接翻 GPIO 完成。因此 seedRaiseThunk / seedLowerThunk / _seedRaiseAlarm / _seedLowerAlarm /
+ *    cancelSeedRequest() 全部是遗迹，已删除（编译期证明无调用者）。 */
 
 void __not_in_flash_func(Rp2040Platform::onFrameDmaDone)()
 {

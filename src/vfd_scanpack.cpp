@@ -60,15 +60,17 @@ void wirePrepareFrame(uint8_t *frame, bool reverseBits)
             frame[i] = reverseBits8(frame[i]);
     }
 
-    /* 扫描相位 −1：第 s 个扫描发逻辑扫描 (s + 1) mod 43 的数据。 */
-    static uint8_t tmp[FRAME_SIZE];
-    for (int i = 0; i < FRAME_SIZE; ++i)
-        tmp[i] = frame[i];
-    for (int s = 0; s < SCANS_PER_FRAME; ++s) {
-        const int src = (s + 1) % SCANS_PER_FRAME;
-        for (int b = 0; b < SCAN_BYTES; ++b)
-            frame[s * SCAN_BYTES + b] = tmp[src * SCAN_BYTES + b];
-    }
+    /* 扫描相位 −1：第 s 个扫描发逻辑扫描 (s + 1) mod 43 的数据 ——
+     * 等价于把整块**左移一个扫描**（48 B），移出的首扫描接到末尾。
+     *
+     * 就地旋转：只暂存首扫描的 48 B，其余整块前移。
+     * ⚠️ 旧实现用 2064 B 的函数内 `static` 暂存：既白占 .bss，又让本函数**不可重入**
+     *    （将来若从两个核/两个上下文调用会互相踩）。现在的实现无静态状态。
+     * 等价性由 tests/test_pio_seed_timing.cpp 的逐字节断言锁死（相位 −1 两个分支都测）。 */
+    uint8_t head[SCAN_BYTES];
+    memcpy(head, frame, SCAN_BYTES);
+    memmove(frame, frame + SCAN_BYTES, (SCANS_PER_FRAME - 1) * SCAN_BYTES);
+    memcpy(frame + (SCANS_PER_FRAME - 1) * SCAN_BYTES, head, SCAN_BYTES);
 }
 
 } /* namespace vfd */

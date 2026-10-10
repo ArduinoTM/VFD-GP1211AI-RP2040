@@ -41,6 +41,11 @@ inline bool pixelGet(const uint8_t *fb, int x, int y)
  * 不会污染"另一组阳极必须为 0"的填充位。 */
 void packScan(const uint8_t *fb, int scan, bool invert, uint8_t *out);
 
+/* 帧结构自检：下面几处按"扫描数 × 每扫描字节数"推地址，前提必须成立 */
+static_assert(FRAME_SIZE == SCANS_PER_FRAME * SCAN_BYTES,
+    "FRAME_SIZE 必须等于 SCANS_PER_FRAME × SCAN_BYTES");
+static_assert(SCAN_BYTES * 8 == 384, "一条扫描对应 384 位栅极链，改了要同步改移位链宽度");
+
 /* 重排整帧：out 必须是 FRAME_SIZE 字节，扫描 0 在前。 */
 void packFrame(const uint8_t *fb, bool invert, uint8_t *out);
 
