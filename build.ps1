@@ -15,7 +15,7 @@
 
   参数（与 CMake 缓存变量一一对应，见 CMakeLists.txt）：
     -Engine    pio | tick | both    扫描引擎（pio = PIO 状态机；tick = 重复定时器 + SPI + DMA）
-    -Diag      on | off             逐秒诊断输出（on = 排故；off = 默认，发布精简 uf2 小 ~22 KB）
+    -Diag      on | off             逐秒诊断输出（on = 排故；off = 默认，发布精简 uf2 小 ~17 KB）
     -DiagUsb                        诊断是否也走 USB（默认只走 UART；USB stdio 的写会阻塞主循环）
     -Type      Release | Debug      构建类型（只影响优化级别/调试信息，与诊断输出无关）
     -Dir       <目录名>             构建目录（默认按选项自动生成，如 build-pio-rel-diagon）
@@ -271,7 +271,7 @@ if (-not $Yes) {
     if (-not $Diag) {
         $Diag = Ask-Choice "② 诊断输出（逐秒打印 rx/cmd/data/gdram_crc/CPU 占用/pinmon/slave-dbg/pc_hist/waits）" @(
             "off   —— 默认：发布精简（只留启动横幅与告警；USB 串口干净）",
-            "on    —— 排故用（逐秒统计只走 UART；uf2 大 ~22 KB）"
+            "on    —— 排故用（逐秒统计只走 UART；uf2 大 ~17 KB（实测 129.5 → 146.5 KB））"
         ) @('off', 'on') $defaultDiag
     }
     if (-not $PSBoundParameters.ContainsKey('Type')) {
@@ -426,5 +426,5 @@ Say ("  诊断输出 {0}{1}" -f $Diag, $(if ($Diag -eq 'on') { $(if ($DiagUsb) {
 if ($DualCore) { Say ("  双核分工已开启：core0=时序+帧发布，core1=SSD1306 数据面") 'DarkGray' }
 Say ""
 Say "烧录：按住 BOOTSEL 插 USB（出现 RPI-RP2 盘）→ 把上面的 .uf2 拖进去。" 'White'
-Say "排故时建议 -Diag on（逐秒诊断）；发布时 -Diag off（uf2 小 ~22 KB）。" 'DarkGray'
+Say "排故时建议 -Diag on（逐秒诊断）；发布时 -Diag off（uf2 小 ~17 KB）。" 'DarkGray'
 exit 0

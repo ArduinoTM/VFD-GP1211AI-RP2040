@@ -12,7 +12,7 @@ STM32F103 Arduino 驱动）**移植到 RP2040 / Raspberry Pi Pico（Pico SDK）*
 128×64 VFD（GP1211AI，无显示控制器）
         │  384bit 阳极链 + 48bit 栅极链 + 45V VDD2 + 2.9Vac 灯丝
    RP2040（Pico SDK, C++17, CMake）—— 两种扫描引擎，编译期二选一
-        ├─ tick（默认）: SPI0 4.46 MHz MODE3 → CLKa/SIa + DMA + repeating_timer 189 µs
+        ├─ tick（默认）: SPI0 4.5 MHz（实测 4.464 MHz = 125 MHz/28）MODE3 → CLKa/SIa + DMA + repeating_timer 189 µs
         └─ pio         : PIO 状态机产生 CLKa/SIa/CLKg/LAT/SIg + 整帧 DMA（CPU 只在帧边界介入）
     公共: PWM（一周期 = 一扫描周期）→ BK 消隐/调光；双缓冲发布；扫描心跳看护
     可选: 双核分工（-DVFD_DUAL_CORE=ON，默认关）—— core0 = 扫描时序 + 帧发布 + 看护，
@@ -66,16 +66,14 @@ STM32F103 Arduino 驱动）**移植到 RP2040 / Raspberry Pi Pico（Pico SDK）*
 │  └─ compat/                  # Arduino 兼容层（让 Adafruit_GFX 在裸 Pico SDK 上编译）
 ├─ lib/Adafruit_GFX/           # vendor 的 Adafruit GFX v1.2.3（BSD，仅必需 4 文件）
 ├─ tests/                      # 宿主机测试（g++，无需嵌入式工具链）
-│  ├─ run_host_tests.ps1       # 一键跑：5 个测试程序共 261 项 + SDK 语法桩检查 + 6 个 .ino 语法检查
+│  ├─ run_host_tests.ps1       # 一键跑：6 个测试程序（261 项 + 核间握手 79102 项）+ SDK 语法桩 + 6 个 .ino 语法
 │  ├─ reference_pack.*         # 原驱动 display() 的 1:1 转录（位重排对照用）
 │  ├─ host_syntax/stub/        # Pico SDK 形状桩（让目标机源码能在 PC 上做 -fsyntax-only）
 │  ├─ host_syntax/stub_arduino/ # Arduino/Adafruit/u8g2 形状桩（给 examples/ 的 .ino 做语法检查）
 │  └─ tools/                   # 逻辑分析仪抓包判读脚本（node：渲染/合规/位序反解）
-├─ hardware/                   # 预留（原理图/实物照片）
 ├─ examples/                   # 主机侧样例 sketch（Pico 2 / Due；u8g2、Adafruit、接线探针）
-├─ hardware/wiring.md          # 接线与电平注意事项
-├─ docs/综合技术报告.md        # 精简技术报告（纯 Markdown）
-└─ hardware/                   # 预留（原理图/实物照片）
+├─ hardware/                   # 接线与电平注意事项（wiring.md）+ 预留（原理图/实物照片）
+└─ docs/综合技术报告.md        # 精简技术报告（纯 Markdown）
 ```
 
 ## 快速开始
@@ -83,7 +81,7 @@ STM32F103 Arduino 驱动）**移植到 RP2040 / Raspberry Pi Pico（Pico SDK）*
 ### 1) 宿主机测试（1 分钟，不需要任何嵌入式工具链）
 
 ```powershell
-powershell -File tests\run_host_tests.ps1      # 需要 g++/clang++（5 个程序：44+93+28+53+43 = 261 项，另加核间握手 79102 项）
+powershell -File tests\run_host_tests.ps1      # 需要 g++/clang++（6 个程序：44+93+28+53+43 = 261 项，另加核间握手回归 79102 项）
 ```
 
 跑的是**目标机同一份驱动源码**（`src/`），用一个模拟扫描引擎的 `MockPlatform`：
@@ -91,7 +89,7 @@ powershell -File tests\run_host_tests.ps1      # 需要 g++/clang++（5 个程�
 `ssd1306_host_tests.exe`（**93 项**）则覆盖 SSD1306 模拟核心（标准初始化+整屏写入 ⇒ 渲染与主机图像逐位一致、
 段/COM 镜像、三种寻址模式与窗口回绕、显示开关/全亮/反显/对比度、未知命令与跨调用拆分的参数、滚动）；
 另有 `pio_seed_timing`（28 项：PIO 程序结构 + 边界四步 + 扫描相位模型）、
-`ssd1306_pio_host_tests`（43 项：从机 PIO 线上格式）、`master_phases_host_tests`（53 项：主控相位序列回放）
+`ssd1306_pio_host_tests`（53 项：从机 PIO 线上格式）、`master_phases_host_tests`（43 项：主控相位序列回放）
 与 `dualcore_handoff`（**79102 项**：双核核间 2 槽 SPSC 协议的全状态组合 —— 丢帧守卫、槽位轮换、最新帧选择）。
 
 脚本还会用**Pico SDK API 形状桩**（`tests/host_syntax/stub/`）对目标机源码
@@ -159,7 +157,7 @@ powershell -ExecutionPolicy Bypass -File build.ps1 -CleanAll                    
 | 参数 | 取值 | 含义 |
 |---|---|---|
 | `-Engine` | `pio` / `tick` / `both` | 扫描引擎 |
-| `-Diag` | `on` / `off` | 逐秒诊断。**默认 `off`**；`on` 时诊断**只走 UART**（GP0/GP1），uf2 大 ~7 KB |
+| `-Diag` | `on` / `off` | 逐秒诊断。**默认 `off`**；`on` 时诊断**只走 UART**（GP0/GP1），uf2 大 ~17 KB（实测 129.5 → 146.5 KB） |
 | `-DiagUsb` | 开关 | 诊断**是否也走 USB**（默认只走 UART）。USB stdio 的写会阻塞主循环，排故时不想额外接 UART 再开它 |
 | `-DualCore` | 开关 | **双核分工**：core0 = 扫描时序 + 帧发布 + 看护，core1 = SSD1306 数据面。默认关 = 与单核逐行为一致 |
 | `-Type` | `Release` / `Debug` | 构建类型（只影响优化级别/调试信息，**与诊断开关无关**） |
@@ -262,7 +260,7 @@ for (;;) {
 
 | 项 | 原驱动（STM32F103） | 本移植（RP2040） |
 |---|---|---|
-| 阳极时钟 | `setClock(12e6)` → 实跑 **9 MHz**（超手册 5 MHz） | **4.46 MHz**，MODE3（空闲高） |
+| 阳极时钟 | `setClock(12e6)` → 实跑 **9 MHz**（超手册 5 MHz） | 目标 **4.5 MHz**（实测 4.464 MHz），MODE3（空闲高） |
 | 阳极数据搬运 | ISR 阻塞式 `SPI.write`，≈24% CPU | **DMA**，ISR 只翻转引脚 + 触发，≈1~2% CPU |
 | 调光 | BK 94 kHz 自由 PWM（违反 Note 7②） | "消隐窗口"：一 PWM 周期 = 一扫描周期 |
 | 桁间消隐 | 无显式实现（Note 16） | ≈100 µs（≫ 5 µs） |
@@ -280,6 +278,10 @@ for (;;) {
   项目概述、硬件与手册要点、软件架构、扫描时序的实机定标结论、SSD1306 模拟支持面、
   与原驱动的差异、验证方法、已知取舍。
 
+> 源码注释里出现的 `docs/NN-*.md`（如 `docs/13`）指向**开发仓库的完整分册文档集**（原驱动不足分析、
+> 移植说明、PIO 引擎、实测定标、SSD1306 行为模拟、排故报告等）。**本仓库只随附上面这份精简报告，
+> 分册不在本仓库内** —— 需要细节时请以源码注释 + 本报告为准，或向维护者索取分册。
+
 ## 当一片 SSD1306 OLED 用（4 线 SPI 从机）
 
 默认模式下本机不渲染任何内置测试图像，而是等主机通过 4 线 SPI 送画面
@@ -287,7 +289,8 @@ for (;;) {
 
 ```cpp
 // 主机（例如另一块 Arduino）：SCK→GP11, MOSI→GP12, DC→GP13, CS→GP14, 共地
-Adafruit_SSD1306 oled(128, 64, &SPI, /*dc=*/9, /*res=*/-1, /*cs=*/10);
+// ⚠️ bitrate 必须显式给 4 MHz：Adafruit_SSD1306 的默认值是 8 MHz（见下方要点）
+Adafruit_SSD1306 oled(128, 64, &SPI, /*dc=*/9, /*res=*/-1, /*cs=*/10, /*bitrate=*/4000000);
 oled.begin(SSD1306_SWITCHCAPVCC, 0);
 oled.clearDisplay();
 oled.setTextSize(2);
@@ -314,13 +317,21 @@ oled.display();      // 调一次即可，本机持续显示
 * **失步看护**：从机检测到硬件 RXSTALL（时钟/数据受扰导致 PIO 停摆）时立刻停 SM 与 DMA、
   丢弃本帧剩余字节并重新对齐（最多损失一帧，不会整屏错位），CS 抬起等待有 20 ms 兜底；
   诊断计数 `stallfix` / `stallforced` 正常恒 0。
-* **主机侧接线与库设置**（`examples/` 下有 u8g2 与 Adafruit 两个样例 + `wiring_probe_due_r4` 探针）：
-  ⚠️ **Adafruit_SSD1306 默认 8 MHz，请显式 `setBusClock(4000000)`**；Arduino Due 的硬件 SPI
-  **只在 2×3 ICSP 排针**（SCK=GPIO76 / MOSI=GPIO75）；Uno R4 Minima 是 5 V，直连超规格。
+* **主机时钟用 4 MHz**（`examples/` 下有 u8g2 与 Adafruit 两个可烧样例 + `wiring_probe_due_r4` 探针）：
+  ⚠️ **`Adafruit_SSD1306` 的 `spiSettings` 默认 8 MHz，请显式给 4 MHz**（构造函数最后的 bitrate 参数，
+  或 `SPI.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE0))`）。理由有三条：
+  · 8 MHz 下 PIO 从机的字节边界余量只剩 ≈85 ns（4 MHz 是 210 ns），CPU 排水占用 >70%（4 MHz ≈35%）；
+  · 更关键的是**帧结构**：`Adafruit_SSD1306::display()` 把"6 条窗口命令 + 1024 B 数据"压在**一次 CS 拉低**里
+    （单事务最大 1030 B），而 u8g2 是每页一个事务（≤132 B）。本机唯一的失步恢复点是 CS 边界
+    (`endTransaction()`，500 µs 去抖) ⇒ 同样一次位相位错位，Adafruit 毁**整帧**、u8g2 最多毁**一页**；
+  · 4 MHz 对 83 fps 刷新绰绰有余。要试 8 MHz 请先读 `docs/综合技术报告.md` §8 的余量说明。
+* **接线**：Arduino Due 的硬件 SPI **只在 2×3 ICSP 排针**（ICSP-3=SCK/GPIO76、ICSP-4=MOSI/GPIO75；
+  数字口 11/12/13 不是 SPI）；Uno R4 Minima 是 **5 V**，直连超规格（需电平转换或先降速短时试）；
+  `DC` 必须接在 MOSI 的下一个 GPIO。
 * **诊断怎么读**（`-Diag on`，每秒一行）：启动横幅的 `fw: <编译时间> …` 唯一标识固件版本；
   `gapmax=<µs>(起点段→终点段,rx+NB,big=N)` 是"本窗口最长多久没把主机数据取走"，以及**当时主机是否在发**
   （`rx+0` ⇒ 没发，无害）。危险线 = 4094 B ÷ 主机字节率：**4 MHz 8.19 ms ｜ 8 MHz 4.09 ms**；
-  实测 4.46 MHz 下修复后为 **2.79 ms**（= 一个 32 B 诊断分块的串口时间，`-Diag on` 的地板），
+  实测 4.464 MHz 下修复后为 **2.79 ms**（= 一个 32 B 诊断分块的串口时间，`-Diag on` 的地板），
   `overrun/drop` 全程 0。
 
 ## 两种扫描引擎怎么选
@@ -342,7 +353,7 @@ oled.display();      // 调一次即可，本机持续显示
 ## 已知取舍
 
 * **峰值亮度 ≈47%**：为满足 Note 7②，阳极数据在消隐期间搬运，点亮窗口最大 ≈89/189。
-  tick 引擎受限于 48 字节移位时间（≈86 µs），PIO 引擎受限于 795 周期的数据阶段（≈88 µs）；
+  tick 引擎受限于 48 字节移位时间（≈86 µs），PIO 引擎受限于 802 周期的数据阶段（≈89.1 µs）；
   两者都会在 `init()` 里自检，必要时抬高 `blank_guard_us`，余量可用 `guardMarginUs()` 读出。
 * 仍是"整帧重排 + 双缓冲"模型（约 4 KB RAM），未改成"每次扫描现场生成 48 字节"。
 * PIO 引擎的**数据通路仍依赖 CPU 换帧**：CPU 长时间不响应帧中断时 DMA 会停供，

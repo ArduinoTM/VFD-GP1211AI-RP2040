@@ -17,6 +17,7 @@ jobs:
   host-tests:
     name: 宿主机测试
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -31,6 +32,7 @@ jobs:
     name: 固件构建（${{ matrix.engine }}${{ matrix.suffix }}）
     needs: host-tests
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -77,6 +79,7 @@ jobs:
     name: 发布 Release
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/download-artifact@v4
         with:

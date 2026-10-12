@@ -45,3 +45,18 @@ node_modules/
 # Python 缓存
 __pycache__/
 *.pyc
+# ---- 构建/临时产物补充（审计发现缺口，2026-10-12）----
+*.exe
+*.obj
+*.pdb
+*.log
+*.orig
+*.bak
+*.rej
+*.tmp
+*.old
+_commit_*.txt
+_tag_*.txt
+_stage_*.txt
+_build*.ps1
+docs/captures/
