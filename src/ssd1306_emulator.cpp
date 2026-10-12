@@ -88,6 +88,11 @@ uint8_t Ssd1306Emulator::paramCountOf(uint8_t cmd)
     case 0x21: /* 列地址窗口 */
     case 0x22: /* 页地址窗口 */
         return 2;
+    case 0xA3: /* 垂直滚动区域（Set Vertical Scroll Area）：**必须吞掉 2 个参数**
+                * ⚠️ 以前漏登记 ⇒ 主机若发 `A3 00 3F`，那两个参数会被当成独立命令解析
+                *    （`0x00` 落在"设置低列地址"⇒ 写指针被挪走、画面错位），且永不自行纠正。
+                *    本模拟器仍不实现滚动区域（与 0xA8/0xDA 同类：只记录/忽略），但参数必须吃掉。 */
+        return 2;
     case 0x26: /* 水平滚动设置 */
     case 0x27:
     case 0x29: /* 垂直+水平滚动设置 */
@@ -280,6 +285,7 @@ void Ssd1306Emulator::applyCommand(uint8_t cmd)
     case 0xD9:
     case 0xDA:
     case 0xDB:
+    case 0xA3: /* 垂直滚动区域：只吞参数（不实现），见 paramCountOf() 的说明 */
         break;
     default:
         _unknownCount++;

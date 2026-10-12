@@ -66,11 +66,14 @@ STM32F103 Arduino 驱动）**移植到 RP2040 / Raspberry Pi Pico（Pico SDK）*
 │  └─ compat/                  # Arduino 兼容层（让 Adafruit_GFX 在裸 Pico SDK 上编译）
 ├─ lib/Adafruit_GFX/           # vendor 的 Adafruit GFX v1.2.3（BSD，仅必需 4 文件）
 ├─ tests/                      # 宿主机测试（g++，无需嵌入式工具链）
-│  ├─ run_host_tests.ps1       # 一键跑：5 个测试程序共 241 项 + SDK 语法桩检查 + .ino 语法检查
+│  ├─ run_host_tests.ps1       # 一键跑：5 个测试程序共 261 项 + SDK 语法桩检查 + 6 个 .ino 语法检查
 │  ├─ reference_pack.*         # 原驱动 display() 的 1:1 转录（位重排对照用）
 │  ├─ host_syntax/stub/        # Pico SDK 形状桩（让目标机源码能在 PC 上做 -fsyntax-only）
+│  ├─ host_syntax/stub_arduino/ # Arduino/Adafruit/u8g2 形状桩（给 examples/ 的 .ino 做语法检查）
 │  └─ tools/                   # 逻辑分析仪抓包判读脚本（node：渲染/合规/位序反解）
 ├─ hardware/                   # 预留（原理图/实物照片）
+├─ examples/                   # 主机侧样例 sketch（Pico 2 / Due；u8g2、Adafruit、接线探针）
+├─ hardware/wiring.md          # 接线与电平注意事项
 ├─ docs/综合技术报告.md        # 精简技术报告（纯 Markdown）
 └─ hardware/                   # 预留（原理图/实物照片）
 ```
@@ -80,21 +83,21 @@ STM32F103 Arduino 驱动）**移植到 RP2040 / Raspberry Pi Pico（Pico SDK）*
 ### 1) 宿主机测试（1 分钟，不需要任何嵌入式工具链）
 
 ```powershell
-powershell -File tests\run_host_tests.ps1      # 需要 g++/clang++（6 个程序：42+81+22+53+43 = 241 项，另加核间握手 79102 项）
+powershell -File tests\run_host_tests.ps1      # 需要 g++/clang++（5 个程序：44+93+28+53+43 = 261 项，另加核间握手 79102 项）
 ```
 
 跑的是**目标机同一份驱动源码**（`src/`），用一个模拟扫描引擎的 `MockPlatform`：
 位重排与原驱动 1:1 转录逐位对比、双射校验、双缓冲无撕裂回归、看护逻辑、示例画面 ASCII 预览；
-`ssd1306_host_tests.exe`（**81 项**）则覆盖 SSD1306 模拟核心（标准初始化+整屏写入 ⇒ 渲染与主机图像逐位一致、
+`ssd1306_host_tests.exe`（**93 项**）则覆盖 SSD1306 模拟核心（标准初始化+整屏写入 ⇒ 渲染与主机图像逐位一致、
 段/COM 镜像、三种寻址模式与窗口回绕、显示开关/全亮/反显/对比度、未知命令与跨调用拆分的参数、滚动）；
-另有 `pio_seed_timing`（22 项：PIO 程序结构 + 边界四步 + 扫描相位模型）、
+另有 `pio_seed_timing`（28 项：PIO 程序结构 + 边界四步 + 扫描相位模型）、
 `ssd1306_pio_host_tests`（43 项：从机 PIO 线上格式）、`master_phases_host_tests`（53 项：主控相位序列回放）
 与 `dualcore_handoff`（**79102 项**：双核核间 2 槽 SPSC 协议的全状态组合 —— 丢帧守卫、槽位轮换、最新帧选择）。
 
 脚本还会用**Pico SDK API 形状桩**（`tests/host_syntax/stub/`）对目标机源码
 （`vfd_platform_rp2040.cpp` / `_tick.cpp` / `_pio.cpp`、`ssd1306_emulator.cpp`、
 `ssd1306_slave_rp2040.cpp`、`main.cpp`，分别以 `-DVFD_SCAN_ENGINE_PIO=0/1`、
-`-DVFD_DEBUG_DIAG=0/1`、`-DVFD_DUAL_CORE=0/1` 的组合编译多遍，共 17 个 SDK 目标 + 3 个 `.ino`）
+`-DVFD_DEBUG_DIAG=0/1`、`-DVFD_DUAL_CORE=0/1` 的组合编译多遍，共 17 个 SDK 目标 + 6 个 `.ino`）
 做 `-fsyntax-only` 语法/类型检查 —— 在没装 pico-sdk 与 arm-none-eabi-gcc 的机器上
 也能抓出语法、类型、成员名错误（它不能替代真实固件构建）。
 
@@ -131,10 +134,10 @@ cmake --build build-dual -j
 >     build-rp2040-pio\vfd_gp1211ai_demo.elf build-rp2040-pio\vfd_gp1211ai_demo.uf2
 > ```
 >
-> 产物（Release，**诊断默认关**）：`build-rp2040/vfd_gp1211ai_demo.uf2`（tick，**113.0 KB**，text 57804 B）与
-> `build-rp2040-pio/vfd_gp1211ai_demo.uf2`（pio，**114.0 KB**，text 58156 B）；
-> 加 `-DVFD_DEBUG_DIAG=on` ⇒ **126.0 / 127.0 KB**；再叠加 `-DVFD_DUAL_CORE=ON` ⇒ 诊断关 **114.5 / 115.5 KB**、
-> 诊断开 **120.0 / 120.5 KB**；干净重建 **0 告警 0 错误**。
+> 产物（Release；**诊断关 / 诊断开**）：
+> `build-rp2040/vfd_gp1211ai_demo.uf2`（tick 单核，**129.5 / 146.5 KB**，text 66148 / 74868 B）与
+> `build-rp2040-pio/vfd_gp1211ai_demo.uf2`（pio 单核，**129.5 / 146.5 KB**，text 66164 / 74756 B）；
+> 双核（`-DVFD_DUAL_CORE=ON`，诊断开）tick **140.0 KB**、pio **139.5 KB**；干净重建一律 **0 告警 0 错误**。
 
 ### 3) 一键构建脚本 `build.ps1`（不想记参数就用它）
 
@@ -148,6 +151,7 @@ powershell -ExecutionPolicy Bypass -File build.ps1 -Engine both -Diag on -Yes   
 powershell -ExecutionPolicy Bypass -File build.ps1 -DualCore -Diag on -DiagUsb -Yes  # 双核 + 诊断同时走 USB 与 UART
 powershell -ExecutionPolicy Bypass -File build.ps1 -Engine pio -Dir build-x -Yes     # 指定构建目录
 powershell -ExecutionPolicy Bypass -File build.ps1 -Test -Clean -Yes                 # 先跑宿主测试、删目录重来
+powershell -ExecutionPolicy Bypass -File build.ps1 -Clean -Yes -CMakeVar VFD_TICK_RX_TOPUP=0  # 额外透传 CMake 变量（可逗号分隔多个）
 powershell -ExecutionPolicy Bypass -File build.ps1 -CleanOnly                        # 只清理本次会用到的构建目录（不编译、不提问）
 powershell -ExecutionPolicy Bypass -File build.ps1 -CleanAll                         # 只清理所有 build-* 与 tests\build（不编译、不提问）
 ```
@@ -164,6 +168,7 @@ powershell -ExecutionPolicy Bypass -File build.ps1 -CleanAll                    
 | `-Clean` | 开关 | 先删本次的构建目录，**再**编译（清理阶段不提问） |
 | `-CleanOnly` | 开关 | **只清理**：删掉本次会用到的构建目录后退出（不编译、不提问） |
 | `-CleanAll` | 开关 | **只清理**：删掉仓库内所有 `build-*` 与 `tests\build` 后退出（不编译、不提问） |
+| `-CMakeVar` | `NAME=VALUE[,NAME=VALUE…]` | 额外透传 CMake 变量（自动补 `-D`；省略 `-Dir` 时构建目录名带 `-custom` 后缀） |
 | `-PioRegen` / `-Yes` / `-Help` | 开关 | 用 pioasm 重新生成 `.pio.h` / 不提问 / 打印详细帮助 |
 
 构建目录后缀：**`-diagon`**（诊断开）/ 无后缀（诊断关，默认）/ **`-diagusb`**（诊断也走 USB）/ **`-dual`**（双核）/ **`-debug`**（Debug 类型）。
@@ -184,6 +189,9 @@ powershell -ExecutionPolicy Bypass -File build.ps1 -CleanAll                    
 | `VFD_EMU_PIN_SCK/MOSI/DC/CS/RESET` | 11/12/13/14/15 | SSD1306 从机引脚（`DC` 必须 = `MOSI+1`；`RESET=255` 表示不接） |
 | `VFD_EMU_PIO_INST` / `VFD_EMU_PIO_SM` | 1 / 0 | 模拟器用的 PIO 块/状态机（须与扫描引擎不同块） |
 | `VFD_EMU_DMA_CH` | 2 | 模拟器 DMA 通道（勿与扫描引擎冲突） |
+| `VFD_TICK_RX_DMA_COUNT` | `0xFFFFFFFF` | tick：RX 排空 DMA 的计数（跑满即补计数 `rearm`；按 48 B/189 µs 折算默认约 2.35 h 一轮） |
+| `VFD_TICK_RX_TOPUP` | 1 | tick：RX DMA 补计数开关（`0` = 关，A/B 实验用） |
+| `VFD_TICK_SERVICE_DRAIN` | 1 | tick：`service()` 里用 CPU 顺带排空 SPI RX FIFO（`0` = 关，A/B 实验用） |
 | `VFD_PIO_REGENERATE` | OFF | 用 pioasm 重新生成 `src/*.pio.h`（改了 `.pio` 才需要） |
 | `VFD_PIN_*` / `VFD_DMA_*` | 见下表 | 覆盖默认接线/通道 |
 | `VFD_STDIO_USB` / `VFD_STDIO_UART` | ON | stdio 开关（无 tinyusb 子模块时关掉 USB） |
@@ -197,12 +205,12 @@ PIO 引擎额外要求 `LAT/CLKg/SIg` 三者**引脚连续**（默认 GP4/5/6）
 |---|---|---|
 | pico-sdk / 工具链 | 2.1.0（含 `lib/tinyusb`）/ xPack GNU Arm Embedded GCC 13.2.1 + Ninja | 同 |
 | 配置 | `-DPICO_BOARD=pico -DCMAKE_BUILD_TYPE=Release` | 同上 + `-DVFD_SCAN_ENGINE=pio` |
-| 诊断输出 | `-DVFD_DEBUG_DIAG=off`（默认）。`on` = 逐秒打印 SSD1306 状态 / CPU 占用 / 帧抖动 / pinmon / slave-dbg / pc_hist / waits，**默认只走 UART**（`-DVFD_DEBUG_DIAG_USB=on` 才同时走 USB）；`off` 只留启动横幅与告警 | 同左（两引擎共用同一份 `main.cpp`）|
-| Flash / RAM | `text 57804 B` / `bss 35416 B`（诊断 off）；诊断 on 时 `text 64500 B` | `text 58156 B` / `bss 37468 B`（诊断 off）；诊断 on 时 `text 64844 B` |
+| 诊断输出 | `-DVFD_DEBUG_DIAG=off`（默认）。`on` = 逐秒打印 SSD1306 状态 / CPU 占用 / 帧抖动 / pinmon / slave-dbg / pc_hist / waits / `gapmax`(排水间隔) / `SCAN`(RX DMA)，**默认只走 UART**（`-DVFD_DEBUG_DIAG_USB=on` 才同时走 USB）；`off` 只留启动横幅与告警 | 同左（两引擎共用同一份 `main.cpp`）|
+| Flash / RAM | 诊断 off `text 66148 B` / `bss 33564 B`；诊断 on `text 74868 B` / `bss 33616 B` | 诊断 off `text 66164 B` / `bss 35604 B`；诊断 on `text 74756 B` / `bss 35656 B` |
 | 中断放置 | `scanTimerThunk`（含内联的 `scanTick`）位于 **RAM 0x200000d4，292 B** | `dmaIrqThunk`（含内联的 `onFrameDmaDone`/排程）位于 **RAM 0x20000150，276 B** |
 | PIO 程序 | 从机 **15/32** 条指令（`ssd1306_spi_slave.pio`，含滚动） | 扫描 **25/32**（`vfd_scan.pio`）+ 从机 15/32，运行时均经 `pio_can_add_program()` 校验 |
-| 产物 | `build-rp2040/…uf2`（诊断关 **113.0 KB** / 诊断开 126.0 KB） | `build-rp2040-pio/…uf2`（诊断关 **114.0 KB** / 诊断开 127.0 KB） |
-| 双核（`-DVFD_DUAL_CORE=ON`） | `build-rp2040-dual/…uf2` **114.5 KB**（诊断开 120.0 KB） | `build-rp2040-pio-dual/…uf2` **115.5 KB**（诊断开 120.5 KB） |
+| 产物 | `build-rp2040/…uf2`（诊断关 **129.5 KB** / 诊断开 146.5 KB） | `build-rp2040-pio/…uf2`（诊断关 **129.5 KB** / 诊断开 146.5 KB） |
+| 双核（`-DVFD_DUAL_CORE=ON`，诊断开） | `build-rp2040-diagon-dual/…uf2` **140.0 KB**（`text 71500 B` / `bss 36688 B`） | `build-rp2040-pio-diagon-dual/…uf2` **139.5 KB**（`text 71228 B` / `bss 38728 B`） |
 
 如果本机没有安装 picotool，可先 `-DPICO_NO_PICOTOOL=1` 配置（此时不产出 uf2），
 再用任意独立 picotool 转换：`picotool uf2 convert <elf> <uf2>`。
@@ -303,6 +311,17 @@ oled.display();      // 调一次即可，本机持续显示
   `boot capture: N B received before this loop (overrun=… drop=…)` 可核对上电窗口接收量。
   主机侧仍建议**上电 ≥150 ms 后再发初始化**（或先把 RESET 拉低 ≥150 ms 再释放）—— RP2040
   自身启动的那几十毫秒无法接收任何字节，详见 `docs/综合技术报告.md` §5。
+* **失步看护**：从机检测到硬件 RXSTALL（时钟/数据受扰导致 PIO 停摆）时立刻停 SM 与 DMA、
+  丢弃本帧剩余字节并重新对齐（最多损失一帧，不会整屏错位），CS 抬起等待有 20 ms 兜底；
+  诊断计数 `stallfix` / `stallforced` 正常恒 0。
+* **主机侧接线与库设置**（`examples/` 下有 u8g2 与 Adafruit 两个样例 + `wiring_probe_due_r4` 探针）：
+  ⚠️ **Adafruit_SSD1306 默认 8 MHz，请显式 `setBusClock(4000000)`**；Arduino Due 的硬件 SPI
+  **只在 2×3 ICSP 排针**（SCK=GPIO76 / MOSI=GPIO75）；Uno R4 Minima 是 5 V，直连超规格。
+* **诊断怎么读**（`-Diag on`，每秒一行）：启动横幅的 `fw: <编译时间> …` 唯一标识固件版本；
+  `gapmax=<µs>(起点段→终点段,rx+NB,big=N)` 是"本窗口最长多久没把主机数据取走"，以及**当时主机是否在发**
+  （`rx+0` ⇒ 没发，无害）。危险线 = 4094 B ÷ 主机字节率：**4 MHz 8.19 ms ｜ 8 MHz 4.09 ms**；
+  实测 4.46 MHz 下修复后为 **2.79 ms**（= 一个 32 B 诊断分块的串口时间，`-Diag on` 的地板），
+  `overrun/drop` 全程 0。
 
 ## 两种扫描引擎怎么选
 
@@ -333,14 +352,14 @@ oled.display();      // 调一次即可，本机持续显示
   （占空 0.5%，视觉上等同全黑）。
 * SSD1306 模拟：只支持 SPI 模式 0；`0xA8` 多路复用比只记录；渲染有 12 ms 节流（最高 83 fps，
   足够呈现最快档滚动 16 ms/步，主机的多次局部刷新会合并显示）；滚动时间基准是折算值
-  （1 帧 = 8 ms，非逐晶振复刻）；环形缓冲 1 KB，异常突发时会计数 `overrunCount()` 并自动重新对齐
-  （正常刷新间隔不会发生）。
+  （1 帧 = 8 ms，非逐晶振复刻）；从机环形缓冲 **16 KB**（4096 字节容量），异常突发时会计数
+  `overrunCount()` / `droppedCount()`、保留最新数据并自动重新对齐。
 
 ## 自动化（GitHub Actions）
 
 | 工作流 | 触发 | 做什么 |
 |---|---|---|
-| [`ci.yml`](.github/workflows/ci.yml) | push 到 `main` / PR / 手动 | 跑宿主机测试（241 项 + 核间握手 79102 项 + SDK 语法桩 + `.ino` 语法），并编译 **4 种固件组合**（tick / pio × 单核 / 双核），uf2 作为构建产物上传 |
+| [`ci.yml`](.github/workflows/ci.yml) | push 到 `main` / PR / 手动 | 跑宿主机测试（261 项 + 核间握手 79102 项 + SDK 语法桩 + 6 个 `.ino` 语法），并编译 **4 种固件组合**（tick / pio × 单核 / 双核），uf2 作为构建产物上传 |
 | [`release.yml`](.github/workflows/release.yml) | 推 `v*` 标签 / 手动 | 先跑测试，再编译同样 4 种组合，然后自动创建 GitHub Release 并把 4 个 uf2 附上（`-tick` / `-pio` / `-tick-dual` / `-pio-dual`，发布说明自动生成）|
 
 发版只需打标签：

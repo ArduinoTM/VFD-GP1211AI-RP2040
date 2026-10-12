@@ -384,6 +384,36 @@ static void test_robustness()
     check(emu.unknownCommandCount() == unknownBefore + 2, "未知命令被计数");
     check(emu.pageAddress() == pageBefore, "未知命令不改变寻址状态");
 
+    /* 0xA3（垂直滚动区域，带 2 个参数）必须被**整条吞掉**。
+     * 以前 paramCountOf() 漏登记它 ⇒ 主机发 `A3 00 3F` 时那两个参数会被当成独立命令解析
+     * （`0x00` = 设置低列地址 ⇒ 写指针被挪走、画面错位，且永不自行纠正 —— 报告 P2-1）。
+     * 判据：发/不发 0xA3 之后写同一幅图，GDDRAM 必须逐字节一致，且只多 1 条命令、不进 unknown。 */
+    {
+        vfd::Ssd1306Emulator ref;
+        vfd::Ssd1306Emulator withA3;
+        emuStandardInit(ref, true);
+        emuStandardInit(withA3, true);
+
+        const uint32_t unknownRef = ref.unknownCommandCount();
+
+        emuCommand(withA3, 0xA3);
+        emuCommand(withA3, 0x00); /* 顶部固定区行数 */
+        emuCommand(withA3, 0x3F); /* 滚动区行数 */
+
+        /* 两个参数必须被当作"参数"吃掉，而不是当成新命令
+         * （0x00 若被当成命令 = 设置低列地址 ⇒ 写指针被挪走、画面错位） */
+        check(withA3.sawAsCommand(0xA3), "0xA3 被当作命令收下");
+        check(withA3.sawAsParam(0x00) && !withA3.sawAsCommand(0x00), "0xA3 的第 1 个参数没被当成命令");
+        check(withA3.sawAsParam(0x3F) && !withA3.sawAsCommand(0x3F), "0xA3 的第 2 个参数没被当成命令");
+        check(withA3.unknownCommandCount() == unknownRef, "0xA3 已被识别（不计入 unknown）");
+
+        hostPattern(4);
+        emuWriteFullFrame(ref, g_host);
+        emuWriteFullFrame(withA3, g_host);
+        check(memcmp(withA3.gdram(), ref.gdram(), vfd::SSD1306_GDDRAM_SIZE) == 0,
+            "0xA3 的参数没被当成命令（GDDRAM 与未发 0xA3 时逐字节一致）");
+    }
+
     /* 多字节命令跨 pushByte 调用拆分（主机可以逐字节发送） */
     emuCommand(emu, 0x21);
     emuCommand(emu, 0x20); /* 只发到第 1 个参数 */

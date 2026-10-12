@@ -109,15 +109,17 @@ Build-And-Run 'dualcore_handoff' @(
 
 # ---------------------------------------------------------------------------
 # ⑥ 主控测试程序（examples 下的 .ino）语法检查
-#    本机没有 arduino-cli，用 Arduino/SPI/U8g2 形状桩把 sketch 编译一遍，
-#    提前抓 API/拼写错误；桩的签名对照真实核心与库，见 stub_arduino/Arduino.h 注释
+#    本机没有 arduino-cli，用 Arduino/SPI/U8g2/Adafruit 形状桩把 sketch 编译一遍，
+#    提前抓 API/拼写错误；桩的签名对照真实核心与库，见 stub_arduino/ 下各头文件的注释
 # ---------------------------------------------------------------------------
 $inoStub = @("-I$(Join-Path $PSScriptRoot 'host_syntax/stub_arduino')")
 $inoTargets = @(
     'examples/pico2_full_test/pico2_full_test.ino',
     'examples/pico2_u8g2_test/pico2_u8g2_test.ino',
     'examples/pico2_bitbang_wiring_test/pico2_bitbang_wiring_test.ino',
-    'examples/due_full_test/due_full_test.ino'              # Arduino Due 移植版（SPI 只在 ICSP 排针上）
+    'examples/due_full_test/due_full_test.ino',              # Arduino Due 移植版（SPI 只在 ICSP 排针上）
+    'examples/pico2_adafruit_test/pico2_adafruit_test.ino',  # Adafruit_SSD1306 主机端（可运行期切 4/8/10 MHz）
+    'examples/wiring_probe_due_r4/wiring_probe_due_r4.ino'   # Due/Uno R4 接线探针（不依赖显示库）
 )
 foreach ($ino in $inoTargets) {
     Write-Host "语法检查(Arduino 桩): $ino" -ForegroundColor DarkGray

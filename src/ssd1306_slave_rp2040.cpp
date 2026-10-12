@@ -19,7 +19,7 @@ constexpr uint32_t RING_MASK = SSD1306_SLAVE_RING_WORDS - 1u;
  * PIO RX FIFO（8 字）在 ~16 µs 内就顶满，状态机随即卡在 `push` 上**丢时钟沿**
  * ⇒ 之后整条流的**位相位**永久错位（未知命令开始增长、画面错乱）。
  * 2026-10-06 第二轮现场日志就是每圈停一次 ⇒ 每圈丢一次位：
- *   `slave-dbg: … dma_left=4096 … laps=0/1/2…` + `stall=1` + 未知命令持续增长。
+ *   `slave-dbg: … dma_left=4096 … laps=0/1/2…` + `stallfix=1`（当时字段名是 `stall`）+ 未知命令持续增长。
  *
  * 现在的取舍：**DMA 连续搬运（绝不停在半路）**，而计数精度由"起始计数 − remaining" + `_base`
  * 保证（见 updatePending()）；计数快用完时只在**总线空闲**（无在途数据）时补满（见 task()）。 */
@@ -51,6 +51,11 @@ constexpr uint32_t DMA_COUNT_TOPUP = 0x40000000u;
  * ⚠️ 真 SSD1306 对"命令与参数之间停顿多久"没有限制，所以去抖越长越不误伤"把一条命令
  *    拆成多次事务发"的主机；代价只是丢字节后自恢复变慢。需要时调大此值。 */
 constexpr uint32_t CS_IDLE_DEBOUNCE_US = 500u;
+
+/* 失步看护里"等 CS 抬起"的上界（µs）。看护停掉 SM/DMA 后本应等主机把 CS 抬起来再重新对齐，
+ * 但 CS 若被接死低（或主机发一个异常长的事务），无限等 = 从机**永久停摆**。
+ * 取 20 ms：远大于任何正常事务（1030 B @1 MHz 也只有 8.2 ms），又能让停摆自愈。 */
+constexpr uint32_t STALL_CS_WAIT_TIMEOUT_US = 20000u;
 
 /* PINCTRL / EXECCTRL 里两个引脚字段的位置（RP2040 数据手册 3.7） */
 constexpr uint32_t PINCTRL_IN_BASE_LSB = 15;
@@ -105,6 +110,10 @@ Ssd1306SpiSlave::Ssd1306SpiSlave(const Ssd1306SpiSlaveConfig &cfg)
     , _txnSeen(false)
     , _txnEnds(0)
     , _pendingTxnEnd(false)
+    , _stallResyncs(0)
+    , _stallForced(0)
+    , _stallAbort(false)
+    , _stallAbortSinceUs(0)
     , _running(false)
     , _error("")
 {
@@ -286,6 +295,10 @@ bool Ssd1306SpiSlave::begin()
     _overruns = 0;
     _resetAsserted = false;
     _pendingResetEvent = false;
+    _stallResyncs = 0;
+    _stallForced = 0;
+    _stallAbort = false;
+    _stallAbortSinceUs = 0;
 
     pio_sm_clear_fifos(_cfg.pio, _cfg.sm);
     pio_sm_exec(_cfg.pio, _cfg.sm, pio_encode_jmp(static_cast<uint>(_offset)));
@@ -303,6 +316,7 @@ void Ssd1306SpiSlave::resetStream()
     pio_sm_set_enabled(_cfg.pio, _cfg.sm, false);
     dma_channel_abort(static_cast<uint>(_cfg.dma_ch));
 
+    _stallAbort = false;
     _popped = 0;
     _base = 0;
     _laps = 0;
@@ -342,6 +356,35 @@ void __not_in_flash_func(Ssd1306SpiSlave::task)()
         return;
 
     updatePending();
+
+    /* ---- 失步看护（本轮新增，报告 P1；见 docs/14 §5）--------------------------------
+     * RXSTALL = "SM 因 RX FIFO 满而卡在 push 上"的**硬件证据**（DMA 跟不上时出现）。
+     * 一旦出现，本帧剩余字节的位相位已经对不上：继续把它们喂给模拟器只会灌进**随机命令/参数**
+     * （可能命中 0xAE/0xA5/0x20 之类，连显示状态一起改坏），而本帧无论如何不可能正确。
+     * 处置：立刻停 SM 与 DMA（不再产出错位字节），等 CS 抬起（事务结束）后 resetStream()
+     * 重新对齐 —— 最坏损失当前这一帧，下一帧干净。
+     * ⚠️ 这**不是**修复已经错位的帧，只是把损失从"整帧花屏 + 状态被改坏"降级为"丢一帧"。
+     *    根治办法是降低主机时钟（4 MHz）/ 缩短接线 / 给模拟器 DMA 更高优先级。
+     * 🔒 等待 CS **必须有界**：CS 被接死低或主机发异常长事务时，无限等 = 从机永久停摆
+     *    （超时次数见 stallForceResyncCount()）。
+     * 触发次数见 stallResyncCount()：正常收流时应恒为 0。 */
+    if (stalled()) {
+        _stallResyncs++;
+        _stallAbort = true;
+        _stallAbortSinceUs = time_us_32();
+        pio_sm_set_enabled(_cfg.pio, _cfg.sm, false);
+        dma_channel_abort(static_cast<uint>(_cfg.dma_ch));
+    }
+    if (_stallAbort) {
+        const bool csHigh = gpio_get(_cfg.pin_cs) != 0;
+        const bool timedOut = (time_us_32() - _stallAbortSinceUs) >= STALL_CS_WAIT_TIMEOUT_US;
+        if (csHigh || timedOut) {
+            if (!csHigh)
+                _stallForced++; /* CS 一直不抬：强制重新对齐，别把从机吊死 */
+            _stallAbort = false;
+            resetStream();
+        }
+    }
 
     /* ---- 事务观测：CS 低 = 事务进行中；CS 抬 = 空闲开始。只记时间，不改变任何行为。 ---- */
     {
@@ -411,7 +454,9 @@ bool Ssd1306SpiSlave::stalled()
 {
     /* FDEBUG 的 RXSTALL 位（SM 因 RX FIFO 满而卡住）。
      * 这是**粘性**标志：一旦置位就一直是 1，而它又是验收判据，所以这里写 1 清除，
-     * 让返回值表示"自上次询问以来是否卡过"，避免给出永久为真的错误结论。 */
+     * 让返回值表示"自上次询问以来是否卡过"，避免给出永久为真的错误结论。
+     * ⚠️ 自 2026-10 起 task() 每轮都会消费它（失步看护），所以应用侧基本读不到 true ——
+     *    要观测"失步过几次"请读 stallResyncCount()（诊断行里是 stallfix=）。 */
     const uint32_t bit = 1u << (PIO_FDEBUG_RXSTALL_LSB + _cfg.sm);
     const bool set = (_cfg.pio->fdebug & bit) != 0;
     if (set)

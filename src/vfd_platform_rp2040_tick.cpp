@@ -120,9 +120,38 @@ void Rp2040Platform::engineDeinit()
 
 void Rp2040Platform::service()
 {
-    /* RX 已由 DMA 持续排空，这里只做保险性清理，避免任何残留把 FIFO 顶满 */
+    /* ---- RX 垃圾桶 DMA 续命（本轮修复，见 docs/13）--------------------------------
+     * 该通道在 configureDma() 里被**一次性**武装成 VFD_TICK_RX_DMA_COUNT 个字节，
+     * 默认 2^32-1：48 B/扫描 × 5291 次/s ⇒ 约 **4.70 h** 跑完；
+     * 跑完之后排空就退化为下面那条 CPU 兜底循环（主循环每轮多几条指令）。
+     * ⚠️ 报告曾断言"跑完后 RX FIFO 顶满 ⇒ PL022 不再发起传输 ⇒ 缺帧 / 静默冻结"——
+     *    **2026-10-12 实机 A/B 没有复现**：对照固件把计数跑到耗尽后 dma_busy_err 仍恒 0、
+     *    画面正常（见 docs/13 §4）。所以本修复的定位是"把 DMA 排空通道恢复成一直活着"
+     *    （CPU 零开销、不再依赖 CPU 兜底的时序），**不是**在修一个已观测到的缺帧。
+     *
+     * 处置：**在剩余不足一半时就补满**（写 TRANS_COUNT 不影响已在途的传输），
+     * 通道一直在搬；万一真跑到 0（例如 TOPUP 关了），`!busy` 分支会把计数重新武装并触发。 */
+#if VFD_TICK_RX_TOPUP
+    {
+        const uint dmaRx = static_cast<uint>(_cfg.dma_rx);
+        if (!dma_channel_is_busy(dmaRx)) {
+            dma_channel_set_trans_count(dmaRx, VFD_TICK_RX_DMA_COUNT, true); /* 通道已停：补计数并触发 */
+            _rxRearms++;
+        } else if (dma_hw->ch[dmaRx].transfer_count < (VFD_TICK_RX_DMA_COUNT / 2u)) {
+            dma_channel_set_trans_count(dmaRx, VFD_TICK_RX_DMA_COUNT, false); /* 在途补满，不重触发 */
+            _rxRearms++;
+        }
+    }
+#endif
+
+    /* 保险性清理：任何残留都读走，避免 RX FIFO 顶满把主机（PL022）卡住。
+     * ⚠️ 这一步在主循环上下文执行，只兜底；真正的持续排空靠上面的 DMA 通道。
+     *    置 VFD_TICK_SERVICE_DRAIN=0 可关掉它（与 TOPUP=0 合用 = 两条排空路径都关），
+     *    用来实测"RX FIFO 满会不会让传输停摆"—— 见 docs/13 §4.4。 */
+#if VFD_TICK_SERVICE_DRAIN
     while (spi_get_hw(_cfg.spi)->sr & SPI_SSPSR_RNE_BITS)
         (void)spi_get_hw(_cfg.spi)->dr;
+#endif
 }
 
 void Rp2040Platform::configureDma()
@@ -141,14 +170,15 @@ void Rp2040Platform::configureDma()
         &spi_get_hw(_cfg.spi)->dr, nullptr, 0, false);
 
     /* RX：PL022 主机在 RX FIFO 满时不会再发起新的传输，只写不读会让 SPI 卡死。
-     * 用一个"永不结束"的 DMA 把收到的字节丢进 _rxSink，CPU 零开销。 */
+     * 用一个**大而有限**的计数把收到的字节丢进 _rxSink，CPU 零开销；计数由 service()
+     * 在剩余不足一半时提前补满（见那里的注释与 docs/13），所以正常永不跑完。 */
     dma_channel_config rx = dma_channel_get_default_config(static_cast<uint>(_cfg.dma_rx));
     channel_config_set_transfer_data_size(&rx, DMA_SIZE_8);
     channel_config_set_read_increment(&rx, false);
     channel_config_set_write_increment(&rx, false);
     channel_config_set_dreq(&rx, spi_get_dreq(_cfg.spi, false));
     dma_channel_configure(static_cast<uint>(_cfg.dma_rx), &rx,
-        &_rxSink, &spi_get_hw(_cfg.spi)->dr, 0xFFFFFFFFu, true);
+        &_rxSink, &spi_get_hw(_cfg.spi)->dr, VFD_TICK_RX_DMA_COUNT, true);
 }
 
 void Rp2040Platform::startScanTimer()
@@ -211,20 +241,19 @@ bool __not_in_flash_func(Rp2040Platform::scanTick)()
         vfdStrobe(_cfg.pin_clkg);
     }
 
-    /* (3) 先 LAT 锁存、后 CLKg 前进——顺序必须与 PIO 引擎一致。
-     *     PIO 的边界脉冲是 `set pins 0x1`（LAT 拉高 = 锁存）→ `set pins 0x2`（LAT 拉低 + CLKg 拉高）：
-     *     LAT 的有效沿在**前**、CLKg 的上升沿（链移位）在**后**，即"锁存旧图案、再走一格"。
-     *     tick 原来写成"先 CLKg 再 LAT" ⇒ 锁存的是**已经走过一格**的图案 ⇒
-     *     每个时序选通的栅极对整体偏一格 = 画面水平错 3 列
-     *     （实测：tick 画面与 pio 最佳对齐 dx=-3）。
-     *     此期间 BK 为消隐，满足手册 Note 7③④，且桁间消隐远大于 Note 16 要求的 5 us。 */
-    /* ⚠️ 边界四步（与 PIO 的 set pins 0x0/0x2/0x3/0x2 一一对应，见 src/vfd_scan.pio）：
+    /* (3) 边界四步：**先前进、再锁存** —— 顺序必须与 PIO 引擎一致。
+     *     手册 Figure 3/5 的硬要求：LAT 空闲低（锁存打正脉冲）、CLKg 空闲高（脉冲低→高，
+     *     上升沿 = 栅极链前进）。顺序上必须"先 CLKg↑ 前进、再 LAT↑ 锁存"：本板 LATa 与 LATg
+     *     并联（手册 Note 15 要求 LATg 常高/透明），锁存的永远是"此刻的栅极链"，
+     *     写成"先锁存后前进"就会锁到**前进之前**的那一对 ⇒ 每个时序选通的栅极对整体偏一格
+     *     = **画面恒定水平错 3 列**（PIO 版抓包实测：LAT 上升沿曾比 CLKg 前进沿早 440 ns；
+     *     tick 版与 pio 版最佳对齐 dx=-3）。此期间 BK 为消隐，满足手册 Note 7③④，
+     *     且桁间消隐远大于 Note 16 要求的 5 us。 */
+    /* ⚠️ 四步与 PIO 的 `set pins 0x0/0x2/0x3/0x2` 一一对应（见 src/vfd_scan.pio）：
      *  ① CLKg 拉低（LAT 上一步已释放为低）——为空出上升沿
      *  ② CLKg↑ = 栅极链前进一位
      *  ③ LAT↑ = 锁存（此刻栅极链已是前进后的状态）
-     *  ④ LAT↓ = 释放；回到空闲（LAT 低、CLKg 高，与手册 Figure 3/5 一致）
-     * 顺序不能反：先锁存后前进会锁到"前进之前"的栅极对 ⇒ 画面恒定平移 3 像素
-     * （PIO 版抓包实测：LAT 上升沿曾比 CLKg 前进沿早 440 ns）。 */
+     *  ④ LAT↓ = 释放；回到空闲（LAT 低、CLKg 高，与手册 Figure 3/5 一致） */
     gpio_put(_cfg.pin_clkg, 0); /* ① */
     rp2040ShortDelayUs(1);
     gpio_put(_cfg.pin_clkg, 1); /* ② 上升沿 = 前进（LAT 仍低） */

@@ -102,6 +102,25 @@
 #ifndef VFD_DMA_RX_CH
 #define VFD_DMA_RX_CH 1
 #endif
+/* RX 垃圾桶 DMA 的初始计数（也是每次补满的值）。2^32-1 个字节在 48 B/扫描 × 5291 次/s
+ * 下约 4.7 h 跑完；service() 会在剩余不足一半时**提前补满**，所以正常永不跑完。
+ * 验收/排故可把它调小（例如 -DVFD_TICK_RX_DMA_COUNT=200000 ⇒ 约 0.8 s 耗尽）
+ * 来复现"计数耗尽"这条路径，见 docs/13。 */
+#ifndef VFD_TICK_RX_DMA_COUNT
+#define VFD_TICK_RX_DMA_COUNT 0xFFFFFFFFu
+#endif
+/* 1 = service() 提前补计数（默认，修复后的行为）；
+ * 0 = 不补计数（只保留 CPU 兜底排空）——**仅供实机 A/B 对照实验**，别用于发布。 */
+#ifndef VFD_TICK_RX_TOPUP
+#define VFD_TICK_RX_TOPUP 1
+#endif
+/* 1 = service() 里那条"保险性清理"（CPU 轮询读走 SPI RX FIFO 残留）保留（默认）；
+ * 0 = 关掉它。与 VFD_TICK_RX_TOPUP=0 合用 = **两条 RX 排空路径都关**，用来判定仓库早期
+ * "陷阱 4：PL022 在 RX FIFO 满时不再发起传输"到底是事实还是传说（见 docs/13 §4.4）。
+ * ⚠️ 仅供实验：真停摆时阳极数据会停（栅极扫描仍在跑，不违反 Note 14）。 */
+#ifndef VFD_TICK_SERVICE_DRAIN
+#define VFD_TICK_SERVICE_DRAIN 1
+#endif
 
 /* ---- pio 引擎资源 ---- */
 #ifndef VFD_PIO_INST /* 0 = pio0, 1 = pio1 */
@@ -189,6 +208,11 @@ public:
     bool engineStalled() const;      /* 引擎当前是否卡住 */
     bool engineError() const { return _engineError; }
     uint32_t dmaBusyErrors() const { return _dmaBusyErrors; }
+#if !VFD_SCAN_ENGINE_PIO
+    /* RX 垃圾桶 DMA 的重新武装次数（tick 专用）。正常约每 2.35 h +1；
+     * 用 VFD_TICK_RX_DMA_COUNT 调小做加速验收时会看到它持续增长。 */
+    uint32_t rxRearmCount() const { return _rxRearms; }
+#endif
     /* 扫描中断累计忙时（µs，单调递增；主循环按秒取差分算占用率）。仅 VFD_DEBUG_DIAG 下更新。 */
     uint32_t irqBusyUs() const { return _irqUs; }
 
@@ -244,6 +268,7 @@ private:
     bool _timerRunning;
     uint32_t _spiBaudrate;
     uint32_t _rxSink; /* RX DMA 的垃圾桶（不递增写入） */
+    volatile uint32_t _rxRearms = 0; /* RX 垃圾桶 DMA 补计数次数（诊断；见 docs/13） */
     uint32_t _guardMarginUs;
     static bool scanTimerThunk(repeating_timer_t *t);
     bool scanTick();

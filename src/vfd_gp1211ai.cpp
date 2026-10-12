@@ -22,6 +22,7 @@ VFD_GP1211AI::VFD_GP1211AI(vfd::Platform &platform)
     , _brightness(200)
     , _published(false)
     , _lastSeq(0)
+    , _waitServiceHook(nullptr)
     , _frameErrors(0)
     , _lastScanCount(0)
     , _lastScanMillis(0)
@@ -229,13 +230,18 @@ void VFD_GP1211AI::waitForFrameBoundary()
     const uint32_t t0 = _platform.millis();
 
     /* 等待扫描引擎进入新的一帧：一旦它开始读"上一次发布的缓冲"，
-     * 另一块缓冲就一定空闲，可以安全地重排进去。 */
+     * 另一块缓冲就一定空闲，可以安全地重排进去。
+     * ⚠️ 这段等待最长 40 ms（FRAME_SYNC_TIMEOUT_MS），而 SSD1306 从机的 16 KB 环形缓冲
+     *    在 4 MHz 下只有 8.2 ms 容量 ⇒ 期间必须让应用层继续排水，否则偶发 overrun/drop
+     *    （实机 2026-10-12 观测到 3 次 overrun / 4263 字）。见 setWaitServiceHook()。 */
     while (_platform.frameStartCount() == seq) {
         if (static_cast<uint32_t>(_platform.millis() - t0) > FRAME_SYNC_TIMEOUT_MS) {
             _frameErrors++; /* 引擎停摆或帧率异常：不再等待，直接发布 */
             break;
         }
         _platform.service();
+        if (_waitServiceHook != nullptr)
+            _waitServiceHook(); /* 应用层排水（例如 SSD1306 从机环形缓冲） */
     }
 }
 

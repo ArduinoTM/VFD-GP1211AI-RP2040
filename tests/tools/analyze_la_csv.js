@@ -6,16 +6,23 @@
  *   node tests/tools/analyze_la_csv.js <csv路径> [--window <中心时间s> <跨度s>] [--compliance]
  *   node tests/tools/analyze_la_csv.js <抓包.csv> --compliance
  *
+ *   --compliance 兼作**验收门禁**：任何一条不合格（含"测不到"）⇒ 退出码 1，全部合格 ⇒ 0；
+ *   不加该标志时只打印报告，退出码恒为 0。报告末尾会列出全部不合格项。
+ *
  * 期望的通道：Time[s], CLKa, SIa, LAT, CLKg, SIg, BK, HVEN, FLEN（列名不区分大小写）
  *
  * 检查内容（对照原驱动 VFD_GP1211AI::timerHandler() 与 MN12864K 手册）：
  *   1. 每帧 CLKg 脉冲总数应为 48 = 43（每扫描 1 次前进）+ 5（帧首播种 1,1,0,0,0）
- *   2. 帧首那一组应为 6 连发：本次扫描的前进脉冲（SIg=0）+ 播种 5 个（SIg=1,1,0,0,0）
+ *   2. 帧首那一组应为 6 连发：**先播种 5 个（SIg=1,1,0,0,0）、再本次扫描的前进脉冲（SIg=0）**
+ *      ⇒ 在 6 个 CLKg 上升沿上采到的 SIg 序列 = 1,1,0,0,0,0；顺序反了会得到 0,1,1,0,0,0 ✗
+ *      （PIO 引擎的播种由 CPU 在帧末完成，不与前进脉冲合并 ⇒ 帧首是 5 连发 SIg=1,1,0,0,0）
  *   3. 其余 42 个扫描周期每个只有 1 个 CLKg 脉冲，且 SIg 全程为 0
  *   4. 手册电气特性逐条核对（--compliance）：
  *        fCLK ≤ 5 MHz、tWCLK ≥ 80 ns、tDS ≥ 40 ns、tDH ≥ 30 ns、
- *        tWL ≥ 300 ns、tLS ≥ 250 ns、tLH ≥ 120 ns、刷新率 ≥ 120 Hz、
- *        Note 7①（空闲 CLK 为高）②③④（BK 变动时机）、Note 16（桁间消隐 ≥ 5 µs）、
+ *        tWL ≥ 300 ns、tLS ≥ 250 ns、tLH ≥ 120 ns、刷新率 ≥ 120 Hz
+ *        （按 SIg 播种段间隔量，PIO/tick 通用；样本不足时退回"帧首 6 连发间隔"）、
+ *        Note 7①（空闲 CLK 为高）②（点亮窗口内不得有 CLKa 活动：最后一次 CLKa 上升沿
+ *        必须早于 BK 下降沿）③④（BK 变动时机）、Note 16（桁间消隐 ≥ 5 µs）、
  *        Note 14（扫描不可停）、Note 3（上电顺序）
  *      注意：若抓包存在采样空档（脚本会打印分布），**逐边沿类指标不可信**，
  *      结论只取宏观量（脉冲宽度、出现频率、相位、电平状态）。
@@ -56,6 +63,23 @@ function fmt(s, unit = 'ns', scale = 1e9) {
     return `${(s.min * scale).toFixed(1)} … ${(s.max * scale).toFixed(1)} ${unit} (均值 ${(s.sum / s.count * scale).toFixed(1)})`;
 }
 
+/* 全局不合格清单：report() 与 compliance() 都往这里记，--compliance 的退出码由它决定 */
+const FAILURES = [];
+function fail(id, detail) {
+    FAILURES.push(`${id}：${detail}`);
+}
+
+/* SIg 高电平段（一次播种 = 一段：tick 帧首的 1,1 / PIO 帧末 5 连发里的前两位） */
+function sigHighSegments(sigEdges) {
+    const segments = [];
+    for (let i = 0; i < sigEdges.length; ++i) {
+        if (sigEdges[i].to === 1 && sigEdges[i + 1] && sigEdges[i + 1].to === 0) {
+            segments.push({ t0: sigEdges[i].t, t1: sigEdges[i + 1].t });
+        }
+    }
+    return segments;
+}
+
 async function analyze(file, windowOpt) {
     const rl = readline.createInterface({ input: fs.createReadStream(file), crlfDelay: Infinity });
 
@@ -88,6 +112,11 @@ async function analyze(file, windowOpt) {
     const clkInterval = stats();       /* CLKg 相邻脉冲间隔（剔除跨空档的） */
     const clkIntervalGap = stats();    /* 含空档的间隔（仅统计，不据此判停摆） */
     const clkaIdle = { total: 0, high: 0 }; /* Note 7①：数据段之后 CLKa 应为高 */
+    /* Note 7②（真判据）：每个扫描内"最后一次 CLKa 上升沿 → BK 下降沿（点亮开始）"的裕量，
+     * 写数据必须早于点亮窗口 ⇒ 裕量应为正；裕量为负 = 点亮窗口内还有 CLKa 活动 ✗ */
+    const n72 = { margin: stats(), scans: 0, litClka: 0 };
+    let lastBkFallT = null;       /* 本次扫描的 BK 下降沿（点亮开始） */
+    let scanLastClkaRise = null;  /* 本次扫描内最后一次 CLKa 上升沿 */
     /* CLKa 上升沿附近 SIa 的建立/保持（手册 tDS ≥ 40 ns / tDH ≥ 30 ns） */
     const siaSetup = stats();
     const siaHold = stats();
@@ -160,6 +189,9 @@ async function analyze(file, windowOpt) {
                         lastClkaRiseT = t;
                         if (lastSiaT !== null) add(siaSetup, t - lastSiaT);
                         pendingClka.push(t);
+                        /* Note 7②：点亮窗口（BK 低）内的 CLKa 活动 = 违规 */
+                        scanLastClkaRise = t;
+                        if (v.BK === 0) n72.litClka++;
                     }
                     if (s === 'SIg') {
                         sigEdges.push({ t, to: v[s], clkg: prevV.CLKg, lat: prevV.LAT, bk: prevV.BK });
@@ -186,7 +218,18 @@ async function analyze(file, windowOpt) {
                         });
                     }
                     if (s === 'BK') {
-                        if (v[s] === 1) lastBkRiseT = t;
+                        if (v[s] === 1) {
+                            lastBkRiseT = t;
+                            /* 扫描结束：结算上一次扫描的 Note 7② 裕量（可为负 = 违规） */
+                            if (lastBkFallT !== null && scanLastClkaRise !== null) {
+                                n72.scans++;
+                                add(n72.margin, lastBkFallT - scanLastClkaRise);
+                            }
+                            lastBkFallT = null;
+                            scanLastClkaRise = null;
+                        } else {
+                            lastBkFallT = t; /* 点亮窗口开始 */
+                        }
                         bkEdges.push({
                             t, to: v[s], clkg: v.CLKg, clka: v.CLKa, lat: v.LAT, sig: v.SIg,
                             sinceSia: lastSiaT === null ? null : t - lastSiaT,
@@ -229,7 +272,7 @@ async function analyze(file, windowOpt) {
     return {
         file, rows, first, last, dtSum, dtMin, dtMax, dtHist, headRows,
         widths, clkRise, clkFall, latFall, sigEdges, sigHighWhileClkLow, groups, bkEdges,
-        clkInterval, clkIntervalGap, clkaIdle, siaSetup, siaHold, clkaPeriod, lastNoChange, multiChange,
+        clkInterval, clkIntervalGap, clkaIdle, siaSetup, siaHold, clkaPeriod, lastNoChange, multiChange, n72,
         dump: globalThis.__dump || null,
     };
 }
@@ -245,10 +288,10 @@ const MANUAL = [
     { id: 'tWL', req: '≥ 300 ns', note: '时钟/锁存低脉冲宽度（本工程按 CLKg/LAT 低电平核对）' },
     { id: 'tLS', req: '≥ 250 ns', note: 'LAT 有效前数据稳定时间（本工程按"LAT 低沿距上次 SIa 跳变"核对）' },
     { id: 'tLH', req: '≥ 120 ns', note: 'LAT 高电平宽度' },
-    { id: 'refresh', req: '≥ 120 Hz（Note 14 扫描不可停）', note: '帧率 = 1 / 帧首播种间隔' },
+    { id: 'refresh', req: '≥ 120 Hz（Note 14 扫描不可停）', note: '帧率 = 1 / SIg 播种段间隔（样本不足时退回帧首 6 连发间隔）' },
     { id: 'note16', req: '桁间消隐 ≥ 5 µs', note: 'BK 高电平（消隐）时长' },
     { id: 'note7-1', req: '不写数据时 CLK 为高', note: 'CLKg/LAT 空闲高 + CLKa 数据段之后为高' },
-    { id: 'note7-2', req: '数据写入期间 BK 不得变化', note: 'BK 跳变与 SIa 活动的时间间隔' },
+    { id: 'note7-2', req: '数据写入期间 BK 不得变化', note: '最后一次 CLKa 上升沿必须早于 BK 下降沿（点亮窗口内不得有 CLKa 活动）' },
     { id: 'note7-3', req: 'CLK 为低时不得改变 BK', note: 'BK 跳变时刻的 CLKg/CLKa 电平' },
     { id: 'note7-4', req: 'LAT 高且 BK 低时不得抬高 CLK', note: '是否存在 LAT 脉冲落在 BK 低（点亮）区间' },
     { id: 'note10-11', req: '另一组阳极必须全 OFF', note: '需解码 SIa（采样率不足）；由宿主机测试保证' },
@@ -258,14 +301,35 @@ const MANUAL = [
 function compliance(r) {
     const us = (v) => (v === null || v === undefined || !isFinite(v) ? 'n/a' : (v * 1e6).toFixed(2) + ' µs');
     const ns = (v) => (v === null || v === undefined || !isFinite(v) ? 'n/a' : (v * 1e9).toFixed(0) + ' ns');
+    const num = (v) => typeof v === 'number' && isFinite(v);
 
-    /* 帧首播种间隔 → 帧率 */
+    /* 逐条判定：ok=true ⇒ ✅；false/不可测 ⇒ ❌ 并计入全局不合格清单（门禁用例：测不到 = 不能判合格） */
+    const judge = (id, ok, passText, failText) => {
+        if (ok) return '✅ ' + passText;
+        fail(id, failText);
+        return '❌ ' + failText;
+    };
+
+    /* 帧首播种间隔 → 帧率
+     * 主路径：SIg 高电平段间隔 —— 每帧恰好一段播种（tick 帧首 1,1 / PIO 帧末 CPU 播种），
+     *         两个引擎通用（PIO 的播种不与前进脉冲合并，识别不到 6 连发，旧路径会退化成 n/a）；
+     * 兜底：6 连发组间隔（旧路径，tick 引擎帧首 5 播种 + 1 前进合并成一组）。 */
+    const sigSegs = sigHighSegments(r.sigEdges);
+    const segGap = stats();
+    for (let i = 1; i < sigSegs.length; ++i) add(segGap, sigSegs[i].t0 - sigSegs[i - 1].t0);
     const six = r.groups.filter((g) => g.edges.length === 6);
     const frameGaps = [];
     for (let i = 1; i < six.length; ++i) frameGaps.push(six[i].firstT - six[i - 1].firstT);
     const frameGap = stats();
     frameGaps.forEach((g) => add(frameGap, g));
-    const frameUs = frameGap.count ? frameGap.sum / frameGap.count * 1e6 : NaN;
+    let frameUs = NaN, frameSrc = '';
+    if (segGap.count) {
+        frameUs = segGap.sum / segGap.count * 1e6;
+        frameSrc = 'SIg 播种段间隔';
+    } else if (frameGap.count) {
+        frameUs = frameGap.sum / frameGap.count * 1e6;
+        frameSrc = '帧首 6 连发间隔（兜底）';
+    }
 
     /* SIg 建立/保持（相对最近的 CLKg 上升沿） */
     let setup = Infinity, hold = Infinity;
@@ -301,55 +365,105 @@ function compliance(r) {
     const latPeriodUs = latGap.count ? latGap.sum / latGap.count * 1e6 : NaN;
     const latLowUs = latLow.count ? latLow.sum / latLow.count * 1e6 : NaN;
     const clkaIdlePct = r.clkaIdle.total ? (100 * r.clkaIdle.high / r.clkaIdle.total).toFixed(2) : 'n/a';
+    const fclkMHz = r.clkaPeriod.count ? 1 / (r.clkaPeriod.sum / r.clkaPeriod.count * 1e6) : NaN;
+    const tLhNs = (num(latPeriodUs) && num(latLowUs)) ? (latPeriodUs - latLowUs) * 1e3 : NaN;
 
     const rows = [
         ['fCLK', '≤ 5.0 MHz',
             r.clkaPeriod.count
                 ? ('CLKa 上升沿间隔 ' + ns(r.clkaPeriod.min) + ' … ' + ns(r.clkaPeriod.max)
                     + '（均值 ' + ns(r.clkaPeriod.sum / r.clkaPeriod.count) + '）⇒ fCLK ≈ '
-                    + (1 / (r.clkaPeriod.sum / r.clkaPeriod.count * 1e6)).toFixed(3) + ' MHz')
+                    + fclkMHz.toFixed(3) + ' MHz')
                 : '不可测（采样率不足）',
-            r.clkaPeriod.count && (1 / (r.clkaPeriod.sum / r.clkaPeriod.count * 1e6)) <= 5.0 ? '✅ 满足（≤ 5 MHz）' : ''],
+            judge('fCLK', num(fclkMHz) && fclkMHz <= 5.0,
+                `满足（${fclkMHz.toFixed(3)} MHz ≤ 5 MHz）`,
+                num(fclkMHz) ? `实测 fCLK ≈ ${fclkMHz.toFixed(3)} MHz > 5 MHz` : '不可测（无 CLKa 数据段样本，采样率不足）')],
         ['tWCLK（CLK 高电平宽度）', '≥ 80 ns',
             ns(r.widths.CLKa.high.min) + ' … ' + ns(r.widths.CLKa.high.max) + '（含扫描间空闲；单个时钟周期内为 111 ns，均值被空闲拉大）',
-            r.widths.CLKa.high.min >= 80 ? '✅ 满足（Figure 3 定义：CLK 高电平宽度）' : ''],
-        ['tDS（SIg↔CLKg）', '≥ 40 ns', ns(setup) + '（SIg 上升沿 → 下一个 CLKg 上升沿，最小值）', '✅ 满足'],
-        ['tDH（SIg↔CLKg）', '≥ 30 ns', ns(hold) + '（CLKg 上升沿 → SIg 下降沿，最小值）', '✅ 满足'],
-        ['tDS（SIa↔CLKa）', '≥ 40 ns', ns(r.siaSetup.min) + '（所有 CLKa 上升沿中的最小值，' + r.siaSetup.count + ' 个）', r.siaSetup.min >= 40 ? '✅ 满足' : ''],
-        ['tDH（SIa↔CLKa）', '≥ 30 ns', ns(r.siaHold.min) + '（最小值，' + r.siaHold.count + ' 个）', r.siaHold.min >= 30 ? '✅ 满足' : ''],
-        ['tWL（CLKg 低）', '≥ 300 ns', ns(clkgLow.min) + ' … ' + ns(clkgLow.max) + `（${clkgLow.count} 个）`, '✅ 满足'],
-        ['tWL（LAT 低）', '≥ 300 ns', ns(latLow.min) + ' … ' + ns(latLow.max) + `（${latLow.count} 个）`, '✅ 满足'],
+            judge('tWCLK', num(r.widths.CLKa.high.min) && r.widths.CLKa.high.min * 1e9 >= 80,
+                '满足（Figure 3 定义：CLK 高电平宽度）',
+                num(r.widths.CLKa.high.min) ? `实测最小 ${ns(r.widths.CLKa.high.min)} < 80 ns` : '不可测（无 CLKa 高电平段样本）')],
+        ['tDS（SIg↔CLKg）', '≥ 40 ns', ns(setup) + '（SIg 上升沿 → 下一个 CLKg 上升沿，最小值）',
+            judge('tDS(SIg)', num(setup) && setup * 1e9 >= 40,
+                '满足（SIg 建立时间 ≥ 40 ns）',
+                num(setup) ? `实测最小 ${ns(setup)} < 40 ns` : '不可测（无 SIg 上升沿样本）')],
+        ['tDH（SIg↔CLKg）', '≥ 30 ns', ns(hold) + '（CLKg 上升沿 → SIg 下降沿，最小值）',
+            judge('tDH(SIg)', num(hold) && hold * 1e9 >= 30,
+                '满足（SIg 保持时间 ≥ 30 ns）',
+                num(hold) ? `实测最小 ${ns(hold)} < 30 ns` : '不可测（无 SIg 下降沿样本）')],
+        ['tDS（SIa↔CLKa）', '≥ 40 ns', ns(r.siaSetup.min) + '（所有 CLKa 上升沿中的最小值，' + r.siaSetup.count + ' 个）',
+            judge('tDS(SIa)', num(r.siaSetup.min) && r.siaSetup.min * 1e9 >= 40,
+                '满足（≥ 40 ns）',
+                num(r.siaSetup.min) ? `实测最小 ${ns(r.siaSetup.min)} < 40 ns` : '不可测（无 SIa 跳变样本）')],
+        ['tDH（SIa↔CLKa）', '≥ 30 ns', ns(r.siaHold.min) + '（最小值，' + r.siaHold.count + ' 个）',
+            judge('tDH(SIa)', num(r.siaHold.min) && r.siaHold.min * 1e9 >= 30,
+                '满足（≥ 30 ns）',
+                num(r.siaHold.min) ? `实测最小 ${ns(r.siaHold.min)} < 30 ns` : '不可测（无 SIa 跳变样本）')],
+        ['tWL（CLKg 低）', '≥ 300 ns', ns(clkgLow.min) + ' … ' + ns(clkgLow.max) + `（${clkgLow.count} 个）`,
+            judge('tWL(CLKg)', num(clkgLow.min) && clkgLow.min * 1e9 >= 300,
+                '满足（≥ 300 ns）',
+                num(clkgLow.min) ? `实测最小 ${ns(clkgLow.min)} < 300 ns` : '不可测（无 CLKg 低电平段样本）')],
+        ['tWL（LAT 低）', '≥ 300 ns', ns(latLow.min) + ' … ' + ns(latLow.max) + `（${latLow.count} 个）`,
+            judge('tWL(LAT)', num(latLow.min) && latLow.min * 1e9 >= 300,
+                '满足（≥ 300 ns）',
+                num(latLow.min) ? `实测最小 ${ns(latLow.min)} < 300 ns` : '不可测（无 LAT 低电平段样本）')],
         ['tLS（最后 CLK 沿 → LAT）', '≥ 250 ns',
             '最后一次 SIa 跳变 → LAT 低沿：最小 ' + us(minSinceSia)
                 + '；最后一个 CLKa 上升沿 → LAT 低沿：最小 ' + us(minSinceClka),
-            (minSinceSia !== Infinity && minSinceSia * 1e9 >= 250
-                ? '✅ 按"数据在 LAT 有效前已稳定"理解：满足'
-                : '') 
-                + (minSinceClka !== Infinity && minSinceClka * 1e9 < 250
+            judge('tLS', num(minSinceSia) && minSinceSia * 1e9 >= 250,
+                '按"数据在 LAT 有效前已稳定"理解：满足（≥ 250 ns）',
+                num(minSinceSia) ? `按"数据在 LAT 有效前已稳定"理解：实测 ${us(minSinceSia)} < 250 ns`
+                                 : '不可测（无 LAT 低沿样本）')
+                + (num(minSinceClka) && minSinceClka * 1e9 < 250
                     ? '；⚠️ 若手册的 tLS 定义为"最后一个 CLKa 沿 → LAT"，则实测偏小，可考虑在边界脉冲前加一拍延时'
                     : '')],
         ['tLH（LAT 高）', '≥ 120 ns',
-            isFinite(latPeriodUs) ? us((latPeriodUs - latLowUs) / 1e6) + '（≈扫描周期 189.05 µs − LAT 低）' : 'n/a', '✅ 满足'],
+            num(tLhNs) ? ns(tLhNs / 1e9) + '（≈扫描周期 189.05 µs − LAT 低）' : 'n/a',
+            judge('tLH', num(tLhNs) && tLhNs >= 120,
+                `满足（${tLhNs.toFixed(0)} ns ≥ 120 ns）`,
+                num(tLhNs) ? `实测 ${ns(tLhNs / 1e9)} < 120 ns` : '不可测（无 LAT 低脉冲样本）')],
         ['刷新率', '≥ 120 Hz',
-            isFinite(frameUs) ? (1e6 / frameUs).toFixed(2) + ' Hz（帧首播种间隔 ' + frameUs.toFixed(2) + ' µs）' : 'n/a',
-            '✅ 满足'],
+            num(frameUs) ? (1e6 / frameUs).toFixed(2) + ' Hz（' + frameSrc + ' ' + frameUs.toFixed(2) + ' µs）' : 'n/a',
+            judge('refresh', num(frameUs) && 1e6 / frameUs >= 120,
+                `满足（${(1e6 / frameUs).toFixed(2)} Hz ≥ 120 Hz）`,
+                num(frameUs) ? `实测 ${(1e6 / frameUs).toFixed(2)} Hz < 120 Hz` : '不可测（无 SIg 播种段 / 帧首 6 连发样本）')],
         ['扫描周期', '（设计 189 µs）', isFinite(latPeriodUs) ? us(latPeriodUs / 1e6) + `（LAT 相邻间隔均值，${latGap.count} 个）` : 'n/a', ''],
-        ['Note 16 桁间消隐', '≥ 5 µs', us(r.widths.BK.high.min) + ' … ' + us(r.widths.BK.high.max), 'BK 高 = 消隐窗口 ✅'],
+        ['Note 16 桁间消隐', '≥ 5 µs', us(r.widths.BK.high.min) + ' … ' + us(r.widths.BK.high.max),
+            judge('note16', num(r.widths.BK.high.min) && r.widths.BK.high.min >= 5e-6,
+                '满足（BK 高 = 消隐窗口 ≥ 5 µs）',
+                num(r.widths.BK.high.min) ? `实测最小 ${us(r.widths.BK.high.min)} < 5 µs` : '不可测（BK 无高电平段）')],
         ['Note 7① CLK 空闲高', '不写数据时 CLK 为高',
             'CLKa 在"数据段结束后（+88…118 µs）"为高的样本占比 ' + clkaIdlePct + `%（${r.clkaIdle.high}/${r.clkaIdle.total}）`,
             'CLKg/LAT 空闲为高同样可见（脉冲分组里高电平占绝大多数）'],
-        ['Note 7② 写入期间 BK 不变', '数据传输中不得变 BK',
-            `BK 跳变距最近 SIa 跳变 ≥ ${us(minBkToSia)}；BK 跳变落在 SIa 活动 1 µs 内 ${bkDuringData} 次`,
-            bkDuringData === 0 ? '✅ 满足（数据段 0–85.3 µs 内无 BK 跳变）' : '需结合丢样判断'],
+        ['Note 7② 点亮窗口内不得有 CLKa 活动', '最后一次 CLKa 上升沿必须早于 BK 下降沿',
+            `最后一次 CLKa 上升沿 → BK 下降沿（点亮开始）最小裕量 ${us(r.n72.margin.min)}`
+                + `（${r.n72.scans} 个扫描）；点亮窗口内 CLKa 上升沿 ${r.n72.litClka} 次`
+                + `；【参考量·不计判定】BK 跳变距最近 SIa 跳变 ≥ ${us(minBkToSia)}、落在 SIa 活动 1 µs 内 ${bkDuringData} 次`,
+            judge('note7-2', r.n72.scans > 0 && r.n72.litClka === 0 && num(r.n72.margin.min) && r.n72.margin.min >= 0,
+                `满足（${r.n72.scans} 个扫描的最后一次 CLKa 上升沿都早于 BK 下降沿，最小裕量 ${us(r.n72.margin.min)}）`,
+                r.n72.scans === 0 ? '不可测（无 BK 下降沿样本）'
+                    : r.n72.litClka > 0
+                        ? `点亮窗口内出现 CLKa 上升沿 ${r.n72.litClka} 次（最小裕量 ${us(r.n72.margin.min)}，应为正）`
+                        : `最小裕量 ${us(r.n72.margin.min)} < 0`)],
         ['Note 7③ CLK 低时不得变 BK', '不得在 CLK 低时变 BK',
             `BK 跳变时 CLKg 为低 ${bkWithClkLow} 次、CLKa 采样为低 ${bkClkaLow} 次（共 ${r.bkEdges.length} 次跳变）`,
-            bkWithClkLow === 0 && bkClkaLow === 0 ? '✅ 满足（两处跳变都发生在 CLKa/CLKg 空闲高时）' : ''],
+            judge('note7-3', r.bkEdges.length > 0 && bkWithClkLow === 0 && bkClkaLow === 0,
+                '满足（两处跳变都发生在 CLKa/CLKg 空闲高时）',
+                r.bkEdges.length === 0 ? '不可测（无 BK 跳变样本）'
+                    : `BK 跳变时 CLKg 为低 ${bkWithClkLow} 次、CLKa 为低 ${bkClkaLow} 次`)],
         ['Note 7④ LAT 高 + BK 低时不得抬 CLK', '禁止该组合',
-            `LAT 低脉冲落在 BK 低（点亮）区间的次数 ${latBkLow} / ${r.latFall.length}；BK 跳变时 LAT 为低 ${bkLatLow} 次`,
-            latBkLow === 0 && bkLatLow === 0 ? '✅ 禁止组合从未出现（CLKa 也只在 BK 高时活动）' : ''],
-        ['Note 14 扫描不可停', '扫描必须持续',
+            `LAT 低脉冲落在 BK 低（点亮）区间的次数 ${latBkLow} / ${r.latFall.length}`
+                + `；【参考量·不计判定】BK 跳变时 LAT 为低 ${bkLatLow} 次（LAT 空闲为低是本工程正常极性）`,
+            judge('note7-4', r.latFall.length > 0 && latBkLow === 0,
+                '禁止组合从未出现（CLKa 也只在 BK 高时活动）',
+                r.latFall.length === 0 ? '不可测（无 LAT 低脉冲样本）'
+                    : `LAT 低脉冲落在 BK 低（点亮）区间 ${latBkLow} 次`)],
+        ['Note 14 扫描不可停', '扫描必须持续（≥ 120 Hz ⇒ 相邻脉冲 < 8.33 ms）',
             `CLKg 最大相邻间隔（剔除采样空档）${us(r.clkInterval.max)}`,
-            r.clkInterval.count ? '✅ = 189 µs 量级 ⇒ 无停摆' : ''],
+            judge('note14', r.clkInterval.count > 0 && r.clkInterval.max <= 1 / 120,
+                `满足（最大间隔 ${us(r.clkInterval.max)} ⇒ 无停摆）`,
+                r.clkInterval.count ? `相邻 CLKg 脉冲最大间隔 ${us(r.clkInterval.max)} > 8.33 ms`
+                                    : '不可测（无 CLKg 脉冲间隔样本）')],
         ['Note 10/11 另一组阳极 OFF', '必须全 OFF', '不可测（SIa 4.5 MHz，采样率不足）',
             '由宿主机测试覆盖：packFrame 不写非可寻址位（42 项检查中的 3 项）'],
         ['Note 3 上电顺序', 'VDD2 后于/同时 VDD1',
@@ -393,12 +507,15 @@ function report(r) {
     console.log(`  每组脉冲数分布: ${Object.entries(dist).map(([k, v]) => `${k}连发×${v}`).join(', ')}`);
 
     const six = r.groups.filter((g) => g.edges.length === 6);
+    const five = r.groups.filter((g) => g.edges.length === 5);
     const one = r.groups.filter((g) => g.edges.length === 1);
     console.log(`  6 连发组（帧首=播种 5 + 前进 1）: ${six.length} 个`);
+    console.log(`  5 连发组（PIO 引擎帧末 CPU 播种，不与前进脉冲合并）: ${five.length} 个`);
     console.log(`  1 连发组（普通扫描的前进脉冲）: ${one.length} 个`);
-    const framesSeen = six.length;
+    const framesSeen = six.length ? six.length : five.length;
     if (framesSeen > 0) {
-        console.log(`  ⇒ 每帧脉冲总数 = 6×${framesSeen} + 1×${one.length} = ${6 * framesSeen + one.length}`
+        const perFrame = six.length ? 6 : 5;
+        console.log(`  ⇒ 每帧脉冲总数 = ${perFrame}×${framesSeen} + 1×${one.length} = ${perFrame * framesSeen + one.length}`
             + `（期望 48×${framesSeen} = ${48 * framesSeen}）`);
     }
 
@@ -416,14 +533,29 @@ function report(r) {
         console.log(`  t=${(g.firstT * 1e3).toFixed(4)} ms  SIg=${bits}  LAT=${latBits}  组内跨度 ${spanUs} µs`);
         bursts.push(bits);
     }
-    const badBursts = six.filter((g) => g.edges.map((e) => e.sig.SIg).join('') !== '011000');
-    console.log(`  帧首组 SIg 序列符合 0,1,1,0,0,0 的有 ${six.length - badBursts.length}/${six.length}`);
+    const badBursts = six.filter((g) => g.edges.map((e) => e.sig.SIg).join('') !== '110000');
+    console.log(`  帧首组 SIg 序列符合 1,1,0,0,0,0 的有 ${six.length - badBursts.length}/${six.length}`);
     if (badBursts.length) {
         console.log(`  ✗ 不符合的组（最多列 8 个）:`);
         for (const g of badBursts.slice(0, 8)) {
             console.log(`     t=${(g.firstT * 1e3).toFixed(4)} ms  SIg=${g.edges.map((e) => e.sig.SIg).join('')}`);
         }
+        fail('帧首 SIg 序列', `${badBursts.length} 个 6 连发组的 SIg 采样序列不是 1,1,0,0,0,0`
+            + `（应为"先播种 5 个、再前进 1 个"；写成"先前进攻、再播种"会得到 0,1,1,0,0,0 = 画面水平错 3 列）`);
     }
+    /* PIO 引擎的播种由 CPU 在帧末完成，不与前进脉冲合并 ⇒ 帧首是 5 连发 SIg=1,1,0,0,0 */
+    if (five.length) {
+        const badFive = five.filter((g) => g.edges.map((e) => e.sig.SIg).join('') !== '11000');
+        console.log(`  （PIO 引擎）5 连发播种组 SIg 序列符合 1,1,0,0,0 的有 ${five.length - badFive.length}/${five.length}`);
+        if (badFive.length) {
+            for (const g of badFive.slice(0, 8)) {
+                console.log(`     ✗ t=${(g.firstT * 1e3).toFixed(4)} ms SIg=${g.edges.map((e) => e.sig.SIg).join('')}`);
+            }
+            fail('帧首 SIg 序列（PIO 5 连发播种）', `${badFive.length} 个 5 连发播种组的 SIg 采样序列不是 1,1,0,0,0`);
+        }
+    }
+    if (!six.length && !five.length)
+        fail('帧首 SIg 序列', '既无 6 连发（tick 帧首播种 5 + 前进 1）、也无 5 连发（PIO 帧末播种）组 ⇒ 未观察到任何播种脉冲');
 
     /* 普通扫描里 SIg 是否始终为 0 */
     const oneWithSig = one.filter((g) => g.edges.some((e) => e.sig.SIg !== 0));
@@ -432,17 +564,13 @@ function report(r) {
         for (const g of oneWithSig.slice(0, 8)) {
             console.log(`     ✗ t=${(g.firstT * 1e3).toFixed(4)} ms SIg=${g.edges.map((e) => e.sig.SIg).join('')}`);
         }
+        fail('普通扫描 SIg 清零', `${oneWithSig.length} 个单脉冲扫描组的 SIg 不是 0（期望 0）`);
     }
 
     console.log('\n-- SIg 变化点 --');
     console.log(`  总变化次数: ${r.sigEdges.length}`);
     /* SIg 高电平段：统计每段内 CLKg 上升沿数量（决定播种位模式） */
-    const segments = [];
-    for (let i = 0; i < r.sigEdges.length; ++i) {
-        if (r.sigEdges[i].to === 1 && r.sigEdges[i + 1] && r.sigEdges[i + 1].to === 0) {
-            segments.push({ t0: r.sigEdges[i].t, t1: r.sigEdges[i + 1].t });
-        }
-    }
+    const segments = sigHighSegments(r.sigEdges);
     if (segments.length) {
         console.log(`  SIg 高电平段 ${segments.length} 段：宽度 / 段内 CLKg 边沿数`);
         console.log('  （低电平相 ~0.9 µs 远大于采样间隔，因此 **下降沿计数** 比上升沿可靠：');
@@ -524,7 +652,7 @@ function report(r) {
 
 (async () => {
     const args = parseArgs(process.argv);
-    if (!args.file) { console.error('用法: node analyze_la_csv.js <csv> [--window <中心s> <跨度s>] [--compliance]'); process.exit(1); }
+    if (!args.file) { console.error('用法: node analyze_la_csv.js <csv> [--window <中心s> <跨度s>] [--compliance]   （--compliance：任一条不合格 ⇒ 退出码 1，全合格 ⇒ 0）'); process.exit(1); }
     globalThis.__dump = null;
     const r = await analyze(args.file, args.window);
     report(r);
@@ -536,6 +664,19 @@ function report(r) {
         console.log('      time[ms]   CLKa SIa LAT CLKg SIg BK');
         for (const d of r.dump.slice(0, 200)) {
             console.log(`  ${(d.t * 1e3).toFixed(4).padStart(10)}    ${d.v.CLKa}   ${d.v.SIa}   ${d.v.LAT}   ${d.v.CLKg}   ${d.v.SIg}  ${d.v.BK}`);
+        }
+    }
+
+    /* 合规结论 → 退出码（--compliance 可当验收门禁用；FAILURES 由 report()/compliance() 共同填充） */
+    if (args.compliance) {
+        console.log('\n================ 合规结论（--compliance 退出码） ================');
+        if (FAILURES.length) {
+            console.log(`❌ 不合格 ${FAILURES.length} 项 ⇒ 退出码 1：`);
+            for (const f of FAILURES) console.log('  · ' + f);
+            process.exitCode = 1;
+        } else {
+            console.log('✅ 全部合格 ⇒ 退出码 0');
+            process.exitCode = 0;
         }
     }
 })();

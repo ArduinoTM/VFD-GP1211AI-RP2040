@@ -1,13 +1,13 @@
 /*
  * Arduino API 形状桩 —— 仅用于**主控测试程序**（examples 下的 .ino）的宿主机语法检查。
  *
- * 本机没装 arduino-cli（见 machine-environment skill），所以用一个"形状正确"的桩把
- * sketch 编译一遍，提前抓拼写/API 用法错误，避免用户烧到 Pico 2 上才发现编不过。
+ * 本机没装 arduino-cli，所以用一个"形状正确"的桩把 sketch 编译一遍，提前抓拼写/API
+ * 用法错误，避免用户烧到 Pico 2 上才发现编不过。
  *
  * ⚠️ 这里的签名必须与 arduino-pico 核心（5.5.1）+ U8g2（olikraus）真实头文件一致；
- *    改动 stub 时请对照：
- *      %LOCALAPPDATA%\Arduino15\packages\rp2040\hardware\rp2040\<ver>\...
- *      %USERPROFILE%\Documents\Arduino\libraries\U8g2\src\U8g2lib.h
+ *    改动 stub 时请对照（路径随 Arduino IDE 的数据目录而变）：
+ *      <Arduino 数据目录>\packages\rp2040\hardware\rp2040\<ver>\...
+ *      <Arduino 用户目录>\libraries\U8g2\src\U8g2lib.h
  */
 #ifndef VFD_STUB_ARDUINO_H
 #define VFD_STUB_ARDUINO_H
@@ -26,6 +26,12 @@
 #define INPUT_PULLUP 2
 
 #define F(x) (x)
+
+/* Print 的进制常量（真实核心在 Print.h 里定义，sketch 直接用 HEX/DEC 等） */
+#define DEC 10
+#define HEX 16
+#define OCT 8
+#define BIN 2
 
 typedef uint8_t byte;
 
@@ -58,12 +64,23 @@ public:
     void print(long v);
     void print(unsigned long v);
     void print(char c);
+    /* 带进制的重载（真实 Print.h 里的 print(unsigned char/int/unsigned int/long/unsigned long, int)） */
+    void print(unsigned char v, int base);
+    void print(int v, int base);
+    void print(unsigned int v, int base);
+    void print(long v, int base);
+    void print(unsigned long v, int base);
     void println(void);
     void println(const char *s);
     void println(int v);
     void println(unsigned int v);
     void println(long v);
     void println(unsigned long v);
+    void println(unsigned char v, int base);
+    void println(int v, int base);
+    void println(unsigned int v, int base);
+    void println(long v, int base);
+    void println(unsigned long v, int base);
 };
 
 class Stream : public Print {

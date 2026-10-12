@@ -29,6 +29,11 @@
     -CleanAll                       只清理：删掉仓库内所有 build-* 目录与 tests\build 后退出（不编译）
     -PioRegen                       用 pioasm 重新生成 src\*.pio.h（改了 .pio 之后必须）
     -DualCore                       双核分工：core1=SSD1306 数据面（core0=时序+帧发布+看护）
+    -CMakeVar <NAME=VALUE>[,…]      额外透传给 CMake 的变量（多个用**逗号**分隔：
+                                     PowerShell 不允许重复写同一个命名参数），例如
+                                      -CMakeVar VFD_TICK_RX_DMA_COUNT=200000
+                                      -CMakeVar VFD_TICK_RX_DMA_COUNT=200000,VFD_TICK_RX_TOPUP=0
+                                    用于实机验收/对照实验（见 docs/13 §6）。未指定 -Dir 时构建目录会加 -custom 后缀。
     -Yes                            不提问，直接用参数/默认值
 #>
 [CmdletBinding()]
@@ -44,6 +49,7 @@ param(
     [switch]$PioRegen,
     [switch]$DualCore,
     [switch]$DiagUsb,
+    [string[]]$CMakeVar,
     [switch]$Yes,
     [switch]$Help
 )
@@ -130,6 +136,7 @@ function Make-DirName([string]$eng) {
     if ($Diag -eq 'on') { $name += '-diagon' }
     if ($DiagUsb) { $name += '-diagusb' }
     if ($DualCore) { $name += '-dual' }
+    if ($CMakeVar) { $name += '-custom' }   # 自定义 CMake 变量的构建单独放，避免覆盖常规目录
     return $name
 }
 
@@ -349,6 +356,16 @@ function Build-Engine([string]$eng, [string]$dirName) {
     if ($PioRegen) {
         $cmakeArgs += '-DVFD_PIO_REGENERATE=ON'
         if ($pioasm) { $cmakeArgs += ("-Dpioasm_DIR={0}" -f (Split-Path $pioasm -Parent)) }
+    }
+    if ($CMakeVar) {
+        # ⚠️ 用 `powershell -File build.ps1 -CMakeVar A=1,B=0` 调用时，逗号**不会**被解析成数组分隔符
+        #    （-File 模式下参数按字面串传入），所以这里再按逗号拆一次。
+        #    反过来，脚本内 `& build.ps1 -CMakeVar @('A=1','B=0')` 也能正常工作（每个元素再拆一次）。
+        foreach ($item in $CMakeVar) {
+            foreach ($v in ($item -split ',')) {
+                if ($v -and $v.Trim()) { $cmakeArgs += ("-D{0}" -f $v.Trim()) }
+            }
+        }
     }
 
     Say ("cmake " + ($cmakeArgs -join ' ')) 'DarkGray'

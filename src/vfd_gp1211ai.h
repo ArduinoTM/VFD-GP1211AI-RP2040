@@ -71,6 +71,15 @@ public:
     /* 位重排 + 发布（内部会等待扫描引擎离开工作缓冲，最坏阻塞一个帧周期 ≈8.1 ms） */
     void display();
 
+    /* ---- 等待期间的服务钩子（长阻塞不能停掉应用层排水）------------------------------
+     * `display()` 里的帧边界等待最长可达 FRAME_SYNC_TIMEOUT_MS（40 ms），期间只调
+     * `Platform::service()`（平台杂务）。如果应用还有别的数据通路需要持续服务
+     * （本工程的 SSD1306 从机环形缓冲：16 KB，4 MHz 下仅 8.2 ms 容量），
+     * 这 40 ms 就足以把它冲掉 —— 表现为诊断行里偶发的 `overrun/drop`。
+     * 注册这个钩子后，等待循环每轮都会调用它；默认 nullptr = 不调用（行为不变）。
+     * ⚠️ 钩子运行在等待循环里，只做"排水"这类短活，**不要**在里面调用 display()。 */
+    void setWaitServiceHook(void (*fn)()) { _waitServiceHook = fn; }
+
     /* 反显：在重排时按像素取反 */
     void invertDisplay(boolean invert) override;
 
@@ -102,6 +111,7 @@ private:
 
     bool _published;          /* 是否已经发布过至少一帧 */
     uint32_t _lastSeq;        /* 上一次发布时的 frameStartCount */
+    void (*_waitServiceHook)(); /* 帧边界等待期间的服务钩子（见 setWaitServiceHook） */
     uint32_t _frameErrors;
 
     uint32_t _lastScanCount;

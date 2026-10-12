@@ -382,6 +382,31 @@ static void test_publish_protocol()
         check(memcmp(plat.latchedFrame(), expectInv, vfd::FRAME_SIZE) == 0,
             "invertDisplay(true) 在重排阶段生效");
     }
+
+    /* 5e. 帧边界等待期间必须给应用层留排水机会（setWaitServiceHook，报告 B P1-2/P2-2）：
+     *     引擎停摆时 display() 会一直等到 FRAME_SYNC_TIMEOUT_MS（40 ms）超时；期间钩子应被
+     *     反复调用 —— 否则 SSD1306 从机的 16 KB 环形缓冲（4 MHz 下仅 8.2 ms 容量）
+     *     会被主机持续送来的数据冲掉（实机观测到一次性 overrun=3 / drop=4263）。 */
+    {
+        static uint32_t hookCalls = 0;
+        MockPlatform plat;
+        VFD_GP1211AI display(plat);
+        display.begin(0);
+        display.display(); /* 先发布一帧，之后 display() 才会进入"等帧边界" */
+
+        hookCalls = 0;
+        display.setWaitServiceHook([]() { hookCalls++; });
+
+        plat.setEngineStopped(true); /* 帧计数不再推进 ⇒ 只能等到超时 */
+        const uint32_t errorsBefore = display.frameErrorCount();
+        display.display();
+
+        check(hookCalls > 0, "帧边界等待期间调用了应用层服务钩子");
+        check(display.frameErrorCount() == errorsBefore + 1, "等待超时记为一次帧同步错误");
+        printf("  等待超时: 钩子被调用 %lu 次（service 共 %lu 次）\n",
+            static_cast<unsigned long>(hookCalls),
+            static_cast<unsigned long>(plat.serviceCalls()));
+    }
 }
 
 /* ------------------------------------------------------- 6：扫描停摆看护 */

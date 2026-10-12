@@ -145,26 +145,97 @@ static volatile uint32_t gCore1RenderUs;
  * 于是把它提到 main() 的**最前面**启动，上电即开始接收；预热与横幅这两段窗口
  * 用 serviceHostLink() 持续排水兜住（单核），双核则由 core1 全程排水。 */
 
-/* 取走环形缓冲里的字节交给模拟器。单核由 core0 调用；**双核下是空实现**：
- * core1 是环形缓冲的唯一消费者，core0 碰它的游标/计数就会撕裂数据通路。 */
+/* ---- 排水间隔监控（仅单核有意义）--------------------------------------------------
+ * 量的是"**上一次排空结束 → 这一次排水开始**"的间隔，也就是真正的**无排水窗口**。
+ * 环形缓冲 4094 B（可用容量），满一圈的时间 = 4094 B ÷ (时钟/8)：
+ *   1 MHz 32.8 ms ｜ 4 MHz **8.19 ms** ｜ 8 MHz **4.09 ms** ｜ 10 MHz 3.28 ms
+ * 所以判据要**按主机时钟换算**，目标是把 gapmax 压到危险线的一半以内。
+ * 见 docs/10 §8 与 docs/14 §4；2026-10-12 用它定位 -Diag on 下的偶发丢数据。
+ *
+ * 光有"多长"还不够 —— 还要知道"**是哪一段**、**主机当时在不在发**"（只有主机在发才会真丢）：
+ *   · `gPhase`：主循环各段的标签（loop/sampl/work/render/print/boot…）；
+ *   · 记录最大间隔的**起点相位 → 终点相位**，以及该间隔内又收到了多少字节（rx+）。
+ * 变量无条件定义（双核下由 serviceHostLink() 显式 (void) 掉，避免"定义未使用"告警）。 */
+static uint32_t gLastDrainUs = 0;
+static uint32_t gDrainGapMaxUs = 0;
+static const char *gPhase = "boot";            /* 当前所在段（由主循环更新） */
+static const char *gLastDrainPhase = "boot";   /* 上一次排空结束时所在的段 */
+static uint32_t gLastDrainRx = 0;              /* 上一次排空结束时的接收字节数 */
+static const char *gGapFrom = "?";             /* 最大间隔：起点段 */
+static const char *gGapTo = "?";               /* 最大间隔：终点段 */
+static uint32_t gGapRx = 0;                    /* 最大间隔期间新收到的字节数（0 ⇒ 主机没在发，无害） */
+static bool gGapRxPending = false;             /* ⚠️ 字节数必须等**本次排水之后**再量：
+                                                * receivedCount() 只在 popByte() 里刷新，在排水前读
+                                                * 恒等于上次的值 ⇒ 差值永远是 0（第一版就是这么错的）。 */
+static uint32_t gBigGapCount = 0;              /* 本窗口 >4 ms 的间隔个数 */
+
+/* 排空一条主机链路的"实例"版本：CS 边沿 / 事务边界 / 复位事件 + 环形缓冲 → 模拟器。
+ * ⚠️ **双核构建下什么都不做**：core1 是环形缓冲的唯一消费者，core0 碰它的游标/计数
+ *    就会撕裂数据通路（所以这里的 `#if` 是**语义**，不是优化）。 */
+static void serviceLink(vfd::Ssd1306SpiSlave &slave, vfd::Ssd1306Emulator &emu)
+{
+#if !VFD_DUAL_CORE
+    { /* 间隔统计：起点是上一次的"排空结束"时刻（gLastDrainUs 在函数末尾更新）。
+       * ⚠️ 不能在函数**开头**就更新时间戳 —— 大流量时一次排水要处理几千字节（好几毫秒），
+       *    那样会把"正在排水"的时间也算进"没排水"，读数虚高（实测到 21.8 ms 就是这么来的）。 */
+        const uint32_t now = time_us_32();
+        const uint32_t gap = now - gLastDrainUs;
+        if (gap > 4000u)
+            gBigGapCount++;
+        if (gap > gDrainGapMaxUs) {
+            gDrainGapMaxUs = gap;
+            gGapFrom = gLastDrainPhase;
+            gGapTo = gPhase;
+            gGapRxPending = true; /* 字节数在本次排水结束后补记（见声明处说明） */
+        }
+    }
+
+    if (slave.running()) {
+        slave.task(); /* CS 边沿 / 事务边界 / 环形缓冲计数补充 */
+        if (slave.consumeResetEvent())
+            emu.reset();
+
+        uint8_t value;
+        bool dc;
+        while (slave.popByte(value, dc))
+            emu.pushByte(value, dc);
+
+        /* 排空之后才能判定"事务结束"（调用约定见 ssd1306_slave_rp2040.h） */
+        if (slave.consumeTransactionEnd())
+            emu.endTransaction();
+    }
+
+    const uint32_t rxNow = slave.running() ? slave.receivedCount() : gLastDrainRx;
+    if (gGapRxPending) {
+        gGapRx = rxNow - gLastDrainRx;
+        gGapRxPending = false;
+    }
+    gLastDrainUs = time_us_32(); /* 本次"排空结束"时刻：下一次的间隔从这里算 */
+    gLastDrainPhase = gPhase;    /* 记住"排空结束时在哪一段"（下次间隔的起点标签） */
+    gLastDrainRx = rxNow;
+#else
+    (void)slave;
+    (void)emu;
+#endif
+}
+
+/* 全局实例上的同一件事。单核由 core0 调用；**双核下是空实现**（见上）。 */
 static void serviceHostLink()
 {
 #if !VFD_DUAL_CORE
-    if (!gSlave.running())
-        return;
-
-    gSlave.task(); /* CS 边沿 / 事务边界 / 环形缓冲计数补充 */
-    if (gSlave.consumeResetEvent())
-        gEmu.reset();
-
-    uint8_t value;
-    bool dc;
-    while (gSlave.popByte(value, dc))
-        gEmu.pushByte(value, dc);
-
-    /* 排空之后才能判定"事务结束"（调用约定见 ssd1306_slave_rp2040.h） */
-    if (gSlave.consumeTransactionEnd())
-        gEmu.endTransaction();
+    serviceLink(gSlave, gEmu);
+#else
+    /* 双核由 core1 全程排水，这些监控在 core0 上没有意义（避免"定义未使用"告警） */
+    (void)gLastDrainUs;
+    (void)gDrainGapMaxUs;
+    (void)gPhase;
+    (void)gLastDrainPhase;
+    (void)gLastDrainRx;
+    (void)gGapFrom;
+    (void)gGapTo;
+    (void)gGapRx;
+    (void)gGapRxPending;
+    (void)gBigGapCount;
 #endif
 }
 
@@ -214,6 +285,10 @@ static void diagWrite(const char *, size_t) { } /* UART stdio 也没开：诊断
 static void diagFlush() { }
 #endif
 
+/* 单个 UART 分块的**最坏耗时**（诊断）：32 B @115200 ≈ 2.78 ms。若某块远超这个数，
+ * 说明阻塞不在我们自己的逻辑里，而在 UART/stdio（例如 USB CDC 也接了同一路输出）。 */
+static uint32_t gUartMaxUs = 0;
+
 static void printChunked(vfd::Ssd1306SpiSlave &slave, vfd::Ssd1306Emulator &emu, bool drain,
     const char *fmt, ...)
 {
@@ -226,12 +301,20 @@ static void printChunked(vfd::Ssd1306SpiSlave &slave, vfd::Ssd1306Emulator &emu,
     const size_t n = strlen(buf);
     for (size_t off = 0; off < n; off += 32) {
         const size_t chunk = (n - off > 32) ? 32 : (n - off);
+        const uint32_t t0 = time_us_32();
         diagWrite(buf + off, chunk);
+        diagFlush(); /* ⚠️ 必须**每块** flush：-DiagUsb 下 diagWrite=fwrite 只是写进 stdio 缓冲，
+                      * 攒到最后再 flush 的话，分块写会挤成一次长时间阻塞 ⇒ 段间排水落空。
+                      * UART 路径的 diagFlush() 是空操作，零成本。 */
+        const uint32_t dt = time_us_32() - t0;
+        if (dt > gUartMaxUs)
+            gUartMaxUs = dt;
         if (drain) {
-            uint8_t v;
-            bool d;
-            while (slave.popByte(v, d))
-                emu.pushByte(v, d);
+            /* ⚠️ 用 serviceLink() 而不是只 popByte()（报告 B P2-2）：
+             * 它同时跑 slave.task()（CS 边沿 / 事务边界判定 / 环形计数补充）与
+             * consumeTransactionEnd() —— 否则这 100+ ms 的诊断窗口里的 CS 边界不会被判定，
+             * 跨窗口的长事务还会被切成两半（表现为未知命令/参数错位）。 */
+            serviceLink(slave, emu);
         }
     }
     diagFlush();
@@ -252,6 +335,36 @@ static const char *pctStr(uint32_t busyUs)
     return b;
 }
 #endif /* VFD_DEBUG_DIAG */
+
+/* ------------------------------------------------------------------ 扫描健康告警
+ * **生产构建（VFD_DEBUG_DIAG=off）也生效**：中断心跳在涨、但平台报"引擎停摆"
+ * （tick = 扫描边界到了而 48 B 还没搬完；pio = SM 卡在 out 等数据）⇒ 扫描实际缺帧。
+ * 手册 Note 14 要求栅极扫描不可停，所以这条必须看得见 —— 而修复前它只存在于默认编译掉的
+ * 诊断块里（见 docs/13）。
+ * 这里**只告警、不自动重启引擎**：recover() 会 engineStop→engineInit→engineStart，
+ * 本身有毫秒级停扫，不该由一条瞬时告警触发。只报一次，避免刷屏。 */
+static bool gScanHealthReported = false;
+
+static void reportScanHealthOnce(const vfd::Rp2040Platform &platform)
+{
+    if (gScanHealthReported || !platform.engineStalled())
+        return;
+    gScanHealthReported = true;
+    /* ⚠️ 用 bootPrintf()（32 B 分块 + 块间排水）而不是 printf()：
+     * printf 走 stdout = UART + USB，USB CDC 在主机不取数据时会长时间阻塞 —— 那就是一个
+     * 几十毫秒的无排水窗口（正是 docs/10 §7/§8 追的那类 bug）。这条告警在**运行期**触发，
+     * 必须按"诊断输出只允许 printChunked()/bootPrintf()"的硬约束走。 */
+#if VFD_SCAN_ENGINE_PIO
+    bootPrintf("!! scan health: %s stalled (SM 卡在 out ⇒ DMA 断流 / 长关中断) —— 扫描缺帧\n",
+        platform.engineName());
+#else
+    bootPrintf("!! scan health: %s stalled (dma_busy_err=%lu  rx_rearm=%lu) —— 扫描边界到了但 48 B 未搬完，"
+           "见 docs/13\n",
+        platform.engineName(),
+        static_cast<unsigned long>(platform.dmaBusyErrors()),
+        static_cast<unsigned long>(platform.rxRearmCount()));
+#endif
+}
 
 /* ------------------------------------------------------------------ 模式 ① */
 
@@ -281,6 +394,7 @@ static void runTestImageLoop(VFD_GP1211AI &display, vfd::Rp2040Platform &platfor
             printf("!! scan engine fatal: faults=%lu, HV disabled\n",
                 static_cast<unsigned long>(display.faultCount()));
         }
+        reportScanHealthOnce(platform); /* 心跳在涨但引擎报停摆 ⇒ 缺帧，生产构建也可见 */
 
         vfd_demo::drawAnimationFrame(display, frame++);
         display.display();
@@ -350,6 +464,9 @@ static void runSsd1306EmulatorLoop(VFD_GP1211AI &display, vfd::Rp2040Platform &p
     display.blitFramebuffer(gRenderBuffer);
     display.display();
 
+    /* （帧边界等待期间的排水钩子已在 startHostLink() 里注册 —— 注册点必须早于上电窗口的
+     *   第一帧 display()，见那里的注释与 docs/10 §7。） */
+
     int lastContrast = -1;
 #if VFD_DEBUG_DIAG
     uint32_t lastStatsUs = time_us_32(); /* 统计周期用 µs 计时（避免 platform.millis() 的 64 位除法拖慢主循环） */
@@ -391,11 +508,16 @@ static void runSsd1306EmulatorLoop(VFD_GP1211AI &display, vfd::Rp2040Platform &p
     bool fatalReported = false;
 
     for (;;) {
+        gPhase = "loop"; /* 排水间隔监控的相位标签（见 gPhase 的说明；只为诊断） */
         if (!display.task() && display.isFatal() && !fatalReported) {
             fatalReported = true;
-            printf("!! scan engine fatal: faults=%lu, HV disabled\n",
+            /* 同 reportScanHealthOnce：运行期告警走 bootPrintf（分块 + 块间排水），
+             * 不用 printf（stdout=UART+USB，USB 不取数据时会长时间阻塞 ⇒ 无排水窗口）。 */
+            bootPrintf("!! scan engine fatal: faults=%lu, HV disabled\n",
                 static_cast<unsigned long>(display.faultCount()));
         }
+        reportScanHealthOnce(platform); /* 心跳在涨但引擎报停摆 ⇒ 缺帧，生产构建也可见 */
+        gPhase = "sampl";
 #if VFD_DEBUG_DIAG
         /* PC 直方图 + push 中断计数（只读；每轮都采） */
         {
@@ -436,30 +558,19 @@ static void runSsd1306EmulatorLoop(VFD_GP1211AI &display, vfd::Rp2040Platform &p
             }
         }
 #endif
-        slave.task();
-
-        /* 主机拉过 RESET：复位模拟器状态 */
-        if (slave.consumeResetEvent())
-            emu.reset();
-
-        /* 取走本轮收到的所有字节 */
-        uint8_t value;
-        bool dc;
+        /* 本轮排水：CS 边沿 / 事务边界 / 复位事件 + 环形缓冲 → 模拟器。
+         * ⚠️ 必须走 serviceLink()（而不是内联 task+popByte）：打印块与帧边界等待里的钩子
+         * 也走这条路，只有共用同一个入口，`gapmax` 统计的才是"两次**排水**之间的间隔"。
+         * （第一版把内联排水留在外面，结果 gapmax 只统计到"打印块之间"≈1 s，无意义。） */
 #if VFD_DEBUG_DIAG
         const uint32_t drainT0 = time_us_32();
 #endif
-        while (slave.popByte(value, dc))
-            emu.pushByte(value, dc);
-
-        /* 环形缓冲已排空 + CS 已释放并空闲去抖 ⇒ 一次 SPI 事务结束。
-         * 让模拟器作废"没来得及收齐参数"的那条命令，从下一事务重新对齐 ——
-         * 这样丢一个字节最多损失一条命令，而不是永久错位（见 ssd1306_slave_rp2040.h）。
-         * ⚠️ 必须在排空之后调用。 */
-        if (slave.consumeTransactionEnd())
-            emu.endTransaction();
+        gPhase = "work";
+        serviceLink(slave, emu);
 #if VFD_DEBUG_DIAG
         core0DrainUs += time_us_32() - drainT0; /* 排水 + 解码 */
 #endif
+        gPhase = "work"; /* 排水之后：滚动 / 对比度 / 渲染判断 */
 
         /* 推进滚动（0x26/0x27/0x29/0x2A 设置 + 0x2F 启动后按时间改写 GDDRAM） */
         emu.tick(platform.millis());
@@ -472,6 +583,7 @@ static void runSsd1306EmulatorLoop(VFD_GP1211AI &display, vfd::Rp2040Platform &p
 
         /* 有新数据且达到最小间隔 → 渲染一帧 */
         if (emu.shouldRender(platform.millis(), EMU_RENDER_MIN_MS)) {
+            gPhase = "render";
 #if VFD_DEBUG_DIAG
             const uint32_t renderT0 = time_us_32();
 #endif
@@ -493,6 +605,7 @@ static void runSsd1306EmulatorLoop(VFD_GP1211AI &display, vfd::Rp2040Platform &p
             const uint32_t cmds = emu.commandCount();
             const uint32_t data = emu.dataCount();
             statCount++;
+                gPhase = "p:head"; /* 本段是"无排水窗口"的头号嫌疑（UART 每 32 B 一块） */
             printChunked(slave, emu, true, "\n---------- [stats #%lu] ----------\n",
                 static_cast<unsigned long>(statCount));
             printChunked(slave, emu, true, "SSD1306  rx=%lu B   cmd=%lu(+%lu)   data=%lu(+%lu)   unknown=%lu\n",
@@ -500,13 +613,15 @@ static void runSsd1306EmulatorLoop(VFD_GP1211AI &display, vfd::Rp2040Platform &p
                 static_cast<unsigned long>(cmds), static_cast<unsigned long>(cmds - commandsAtStats),
                 static_cast<unsigned long>(data), static_cast<unsigned long>(data - dataAtStats),
                 static_cast<unsigned long>(emu.unknownCommandCount()));
-            printChunked(slave, emu, true, "         overrun=%lu(+%lu)   drop=%lu(+%lu)   resync=%lu   stall=%d   disp=%d   contrast=%u   gdram_crc=0x%08lx\n",
+            printChunked(slave, emu, true, "         overrun=%lu(+%lu)   drop=%lu(+%lu)   resync=%lu   stallfix=%lu  stallforced=%lu   disp=%d   contrast=%u   gdram_crc=0x%08lx\n",
                 static_cast<unsigned long>(slave.overrunCount()),
                 static_cast<unsigned long>(slave.overrunCount() - overrunsAtStats),
                 static_cast<unsigned long>(slave.droppedCount()),
                 static_cast<unsigned long>(slave.droppedCount() - droppedAtStats),
                 static_cast<unsigned long>(emu.resyncCount()), /* 真正作废半条命令的次数 */
-                slave.stalled() ? 1 : 0, emu.displayOn() ? 1 : 0,
+                static_cast<unsigned long>(slave.stallResyncCount()),      /* 失步看护触发次数（正常恒 0） */
+                static_cast<unsigned long>(slave.stallForceResyncCount()), /* 其中"等 CS 抬起超时"的强制对齐次数 */
+                emu.displayOn() ? 1 : 0,
                 static_cast<unsigned>(emu.contrast()),
                 static_cast<unsigned long>(emu.gdramCrc32())); /* 与主控测试程序打印的图像 CRC 对照 */
             /* ---- 排故：把"哪些 DC=0 字节被当成命令收下 / 被当成参数吃掉"两张位图打出来。
@@ -515,24 +630,25 @@ static void runSsd1306EmulatorLoop(VFD_GP1211AI &display, vfd::Rp2040Platform &p
              *   只在参数那张里 ⇒ 到了但被当前命令当参数吃了（解析错位，通常是丢了/多了字节）。 */
             {
                 char line[200];
+                gPhase = "p:trace"; /* 诊断相位标签：gapmax 用它点名是哪一行 */
                 int n = snprintf(line, sizeof(line), "TRACE    cmdSeen:");
                 for (int b = 0; b < 256; ++b)
                     if (emu.sawAsCommand(static_cast<uint8_t>(b)) && n < (int)sizeof(line) - 6)
                         n += snprintf(line + n, sizeof(line) - n, " %02X", b);
-                diagWrite(line, (size_t)n);
+                printChunked(slave, emu, true, "%s", line);
                 n = snprintf(line, sizeof(line), "\n         paramSeen:");
                 for (int b = 0; b < 256; ++b)
                     if (emu.sawAsParam(static_cast<uint8_t>(b)) && n < (int)sizeof(line) - 6)
                         n += snprintf(line + n, sizeof(line) - n, " %02X", b);
                 n += snprintf(line + n, sizeof(line) - n, "\n");
-                diagWrite(line, (size_t)n);
-                diagFlush();
+                printChunked(slave, emu, true, "%s", line);
             }
             /* ---- 事务间隔直方图：为"CS 边界重同步"的去抖窗口提供实测依据。
              * 判读：若绝大多数间隔落在 <1/<2/<5 µs（u8g2 背靠背的 tile 事务），
              * 而另有一撮落在数百 µs ~ ms（两次独立操作之间），去抖就取两者之间。 */
             {
                 char line[200];
+                gPhase = "p:txn"; /* 诊断相位标签：gapmax 用它点名是哪一行 */
                 int n = snprintf(line, sizeof(line), "TXN      n=%lu  gaps:",
                     static_cast<unsigned long>(slave.txnCount()));
                 for (int i = 0; i < vfd::Ssd1306SpiSlave::TXN_GAP_BUCKETS; ++i) {
@@ -543,9 +659,9 @@ static void runSsd1306EmulatorLoop(VFD_GP1211AI &display, vfd::Rp2040Platform &p
                             static_cast<unsigned long>(c));
                 }
                 n += snprintf(line + n, sizeof(line) - n, "\n");
-                diagWrite(line, (size_t)n);
-                diagFlush();
+                printChunked(slave, emu, true, "%s", line);
             }
+                gPhase = "p:scroll"; /* 诊断相位标签：gapmax 用它点名是哪一行 */
             printChunked(slave, emu, true, "         scroll: active=%d mode=%d %s pages=%u-%u interval=%u(%lu ms/step) v=%u steps=%lu\n",
                 emu.scrollActive() ? 1 : 0, static_cast<int>(emu.scrollMode()),
                 emu.scrollRight() ? "right" : "left",
@@ -555,11 +671,18 @@ static void runSsd1306EmulatorLoop(VFD_GP1211AI &display, vfd::Rp2040Platform &p
                 static_cast<unsigned long>(emu.scrollStepCount()));
 
             /* ---- 接线诊断（只读）---- */
+                gPhase = "p:wiring"; /* 诊断相位标签：gapmax 用它点名是哪一行 */
             printChunked(slave, emu, true, "-- wiring --\n");
             {
                 char verdict[4][24];
+                /* 本窗口确实收到了命令/数据 ⇒ 线一定是通的，别报"疑未接通"：
+                 * 实测（2026-10-12）一整帧 1030 B 之后 MOSI 的 chg 仍为 0 —— 数据里 0x00 占多数时
+                 * 主循环的轮询采样本来就可能数不到跳变，但字节一个不少（rx/cmd/data 都在涨）。
+                 * 否则这条会把人引向"接线"而离开真正的问题（上一轮就误导过一次）。 */
+                const bool linkAlive = (data != dataAtStats) || (cmds != commandsAtStats);
                 for (int i = 0; i < 4; ++i) {
-                    if (monChg[i] == 0)      snprintf(verdict[i], sizeof(verdict[i]), "%s", "无跳变(疑未接通)");
+                    if (monChg[i] == 0)      snprintf(verdict[i], sizeof(verdict[i]), "%s",
+                                                 linkAlive ? "无跳变但有数据" : "无跳变(疑未接通)");
                     else if (!monLow[i])     snprintf(verdict[i], sizeof(verdict[i]), "%s", "从未变低");
                     else if (!monHigh[i])    snprintf(verdict[i], sizeof(verdict[i]), "%s", "从未变高");
                     else                     snprintf(verdict[i], sizeof(verdict[i]), "%s", "正常");
@@ -569,14 +692,16 @@ static void runSsd1306EmulatorLoop(VFD_GP1211AI &display, vfd::Rp2040Platform &p
                     monPins[1], monLast[1], static_cast<unsigned long>(monChg[1]), verdict[1],
                     monPins[2], monLast[2], static_cast<unsigned long>(monChg[2]), verdict[2],
                     monPins[3], monLast[3], static_cast<unsigned long>(monChg[3]), verdict[3]);
-                /* 上电头 3 秒还没开始发数据，别喊"未接通"（那时的 chg=0 是正常的） */
-                const bool started = platform.millis() > 3000;
+                /* 上电头 3 秒还没开始发数据，别喊"未接通"（那时的 chg=0 是正常的）；
+                 * 本窗口有数据流动时同理（见 linkAlive 的说明）。 */
+                const bool started = platform.millis() > 3000 && !linkAlive;
                 if (started && (monChg[3] == 0 || !monLow[3]))
                     printChunked(slave, emu, true, "  !! CS(GP14) 从未变低 => 从机停在 wait 0 gpio CS，收不到任何字节：查 CS 是否接到 GP14、是否共地\n");
                 if (started && monChg[0] == 0)
                     printChunked(slave, emu, true, "  !! SCLK(GP11) 无跳变 => 没有时钟进来：查 SCK 是否接在 GP11（与 MOSI 接反也如此）\n");
             }
             /* ---- 从机诊断：状态机 PC / RX FIFO / DMA ---- */
+                gPhase = "p:slave"; /* 诊断相位标签：gapmax 用它点名是哪一行 */
             printChunked(slave, emu, true, "SLAVE    pc=+%d(%s)  rx_fifo=%d  dma_busy=%d  dma_wr=0x%08lx  dma_left=%lu  ring_pending=%ld  laps=%lu\n",
                 slave.debugPcOffset(), slave.debugPcName(), slave.debugRxFifo(),
                 slave.debugDmaBusy(),
@@ -596,6 +721,7 @@ static void runSsd1306EmulatorLoop(VFD_GP1211AI &display, vfd::Rp2040Platform &p
                 for (int i = 3; i < 16; ++i) beyondFirstWait += pcHist[i];
 
                 char hist[192];
+                gPhase = "p:smpl"; /* 诊断相位标签：gapmax 用它点名是哪一行 */
                 int hl = snprintf(hist, sizeof(hist), "pc_hist(共%lu次采样): ", static_cast<unsigned long>(total));
                 for (int i = 0; i < 16 && hl > 0 && static_cast<size_t>(hl) < sizeof(hist); ++i)
                     if (pcHist[i])
@@ -615,6 +741,7 @@ static void runSsd1306EmulatorLoop(VFD_GP1211AI &display, vfd::Rp2040Platform &p
                     static_cast<unsigned>(slave.debugJmpPin()),
                     static_cast<unsigned long>(slave.debugShiftCtrl()));
                 char waits[256];
+                gPhase = "p:waits"; /* 诊断相位标签：gapmax 用它点名是哪一行 */
                 int wl = snprintf(waits, sizeof(waits), "WAITS    (装载镜像 %lu 条, 装载时已自检):",
                     static_cast<unsigned long>(slave.debugLoadedWords()));
                 for (int i = 0; i < static_cast<int>(slave.debugLoadedWords())
@@ -633,6 +760,7 @@ static void runSsd1306EmulatorLoop(VFD_GP1211AI &display, vfd::Rp2040Platform &p
 
                 /* ---- 判读：只在"确实卡住"时才报警，避免把正常的等待当故障 ---- */
                 if (slave.debugRxFifo() > 0) {
+                gPhase = "p:verdict"; /* 诊断相位标签：gapmax 用它点名是哪一行 */
                     printChunked(slave, emu, true, "VERDICT  !! RX FIFO 有字但没进环形缓冲：卡在 DMA（DREQ/通道/写地址）\n");
                 } else if (pushIrqCount == 0 && beyondFirstWait == 0 && slave.receivedCount() == 0) {
                     const int pc = slave.debugPcOffset();
@@ -649,23 +777,54 @@ static void runSsd1306EmulatorLoop(VFD_GP1211AI &display, vfd::Rp2040Platform &p
                 }
                 for (int i = 0; i < 16; ++i) pcHist[i] = 0;
             }
-            /* 口径 A：core0 忙时占比（4 子项，1% = 10000 µs）。 */
-            printChunked(slave, emu, true, "CPU      core0: irq=%s%%  drain=%s%%  render=%s%%  work=%s%%\n",
+            /* 口径 A：core0 忙时占比（4 子项，1% = 10000 µs）。
+             * `gapmax` = 本窗口"上一次排空结束 → 这一次排水开始"的最长间隔；
+             * 括号里是**起点段→终点段**与**该间隔内新收到的字节数**：
+             *   · 段名指出"谁把主循环占住了"（print=诊断打印 / render=渲染+等帧边界 / work=滚动等）；
+             *   · `rx+0B` ⇒ 主机当时没在发数据，这个间隔无害（这就是"gapmax 大却没丢"的原因）；
+             *   · `big` = 本窗口 >4 ms 的间隔个数（多不多）。
+             * 危险线按主机时钟换算（4094 B ÷ 字节率）：4 MHz 8.19 ms、8 MHz 4.09 ms。 */
+                gPhase = "p:cpu"; /* 诊断相位标签：gapmax 用它点名是哪一行 */
+            printChunked(slave, emu, true, "CPU      core0: irq=%s%%  drain=%s%%  render=%s%%  work=%s%%   gapmax=%luus(%s→%s,rx+%luB,big=%lu)  uartmax=%luus\n",
                 pctStr(platform.irqBusyUs() - irqUsAt),
                 pctStr(core0DrainUs),
                 pctStr(core0RenderUs),
-                pctStr(core0WorkUs));
+                pctStr(core0WorkUs),
+                static_cast<unsigned long>(gDrainGapMaxUs),
+                gGapFrom, gGapTo,
+                static_cast<unsigned long>(gGapRx),
+                static_cast<unsigned long>(gBigGapCount),
+                static_cast<unsigned long>(gUartMaxUs));
+                gPhase = "p:frame"; /* 诊断相位标签：gapmax 用它点名是哪一行 */
             printChunked(slave, emu, true, "FRAME    us min=%lu  avg=%lu  max=%lu  (N=%lu)\n",
                 static_cast<unsigned long>(frameJitMin),
                 static_cast<unsigned long>(frameJitCount ? frameJitSum / frameJitCount : 0),
                 static_cast<unsigned long>(frameJitMax),
                 static_cast<unsigned long>(frameJitCount));
+#if !VFD_SCAN_ENGINE_PIO
+            /* tick 专用：RX 垃圾桶 DMA 的补计数次数 + "扫描边界到了但 48 B 未搬完"的次数。
+             * 正常：rearm 每 2.35 h 才 +1（默认计数），dma_busy_err 恒 0（见 docs/13）。 */
+                gPhase = "p:scan"; /* 诊断相位标签：gapmax 用它点名是哪一行 */
+            printChunked(slave, emu, true, "SCAN     tick RX DMA: rearm=%lu  dma_busy_err=%lu  (稳态应不变/0)\n",
+                static_cast<unsigned long>(platform.rxRearmCount()),
+                static_cast<unsigned long>(platform.dmaBusyErrors()));
+#endif
 
             /* 基线推进：先读回最新值，再把本次打印自身算进 core0 实事 */
             irqUsAt = platform.irqBusyUs();
             core0DrainUs = 0;
             core0RenderUs = 0;
             core0WorkUs = time_us_32() - printT0;
+#if !VFD_DUAL_CORE
+            /* 排水间隔监控**按窗口清零**（⚠️ 第一次加漏在了双核那份循环里 ⇒ 单核读出来的是
+             * "开机至今的最大值"，恒 ≈22 ms，看着吓人但其实只是上电那一次；2026-10-12 修正） */
+            gDrainGapMaxUs = 0;
+            gBigGapCount = 0;
+            gGapRx = 0;
+            gGapFrom = "-";
+            gGapTo = "-";
+            gUartMaxUs = 0;
+#endif
 
             frameJitMin = 0xFFFFFFFFu;
             frameJitMax = 0;
@@ -836,6 +995,8 @@ static void runSsd1306EmulatorLoopDualCore(VFD_GP1211AI &display, vfd::Rp2040Pla
                 static_cast<unsigned long>(display.faultCount()));
         }
 
+        reportScanHealthOnce(platform); /* 心跳在涨但引擎报停摆 ⇒ 缺帧，生产构建也可见 */
+
         if (gHandoff.slaveFailed && !slaveFailedReported) {
             slaveFailedReported = true;
             printf("!! SSD1306 slave init failed: %s\n", slave.lastError());
@@ -899,13 +1060,15 @@ static void runSsd1306EmulatorLoopDualCore(VFD_GP1211AI &display, vfd::Rp2040Pla
                 static_cast<unsigned long>(cmds), static_cast<unsigned long>(cmds - commandsAtStats),
                 static_cast<unsigned long>(data), static_cast<unsigned long>(data - dataAtStats),
                 static_cast<unsigned long>(emu.unknownCommandCount()));
-            printChunked(slave, emu, false, "         overrun=%lu(+%lu)   drop=%lu(+%lu)   resync=%lu   stall=%d   disp=%d   contrast=%u   gdram_crc=0x%08lx\n",
+            printChunked(slave, emu, false, "         overrun=%lu(+%lu)   drop=%lu(+%lu)   resync=%lu   stallfix=%lu  stallforced=%lu   disp=%d   contrast=%u   gdram_crc=0x%08lx\n",
                 static_cast<unsigned long>(slave.overrunCount()),
                 static_cast<unsigned long>(slave.overrunCount() - overrunsAtStats),
                 static_cast<unsigned long>(slave.droppedCount()),
                 static_cast<unsigned long>(slave.droppedCount() - droppedAtStats),
                 static_cast<unsigned long>(emu.resyncCount()), /* 真正作废半条命令的次数 */
-                slave.stalled() ? 1 : 0, emu.displayOn() ? 1 : 0,
+                static_cast<unsigned long>(slave.stallResyncCount()),      /* 失步看护触发次数（正常恒 0） */
+                static_cast<unsigned long>(slave.stallForceResyncCount()), /* 其中"等 CS 抬起超时"的强制对齐次数 */
+                emu.displayOn() ? 1 : 0,
                 static_cast<unsigned>(emu.contrast()),
                 static_cast<unsigned long>(emu.gdramCrc32()));
             { /* 排故位图，含义见单核分支同处注释 */
@@ -960,6 +1123,13 @@ static void runSsd1306EmulatorLoopDualCore(VFD_GP1211AI &display, vfd::Rp2040Pla
                 static_cast<unsigned long>(frameJitCount ? frameJitSum / frameJitCount : 0),
                 static_cast<unsigned long>(frameJitMax),
                 static_cast<unsigned long>(frameJitCount));
+#if !VFD_SCAN_ENGINE_PIO
+            /* tick 专用：RX 垃圾桶 DMA 的补计数次数 + "扫描边界到了但 48 B 未搬完"的次数。
+             * 正常：rearm 每 2.35 h 才 +1（默认计数），dma_busy_err 恒 0（见 docs/13）。 */
+            printChunked(slave, emu, false, "SCAN     tick RX DMA: rearm=%lu  dma_busy_err=%lu  (稳态应不变/0)\n",
+                static_cast<unsigned long>(platform.rxRearmCount()),
+                static_cast<unsigned long>(platform.dmaBusyErrors()));
+#endif
 
             /* 基线推进：先读回最新值，再把本次打印自身算进 core0 实事 */
             irqUsAt = platform.irqBusyUs();
@@ -1001,6 +1171,8 @@ static void startHostLink()
     if (gHostLinkArmed)
         return;
     gHostLinkArmed = true;
+
+    /* ---- 排水钩子在 main() 里、预热之前注册（见那里的注释）---- */
 
     if (!gSlave.begin()) {
         /* 失败原因由 runSsd1306EmulatorLoop*() 打印（这里不死等，保持扫描心跳） */
@@ -1048,8 +1220,20 @@ int main()
     /* ⚠️ 顺序关键：**先**打开主机接收通路，**再**做灯丝预热与横幅打印。
      * 反过来（旧顺序）会把复位后前 ~500 ms 的主机数据全丢掉 —— 初始化序列与首批
      * 画面都收不到，模拟器状态与主机不一致。详见 startHostLink()/serviceHostLink()。 */
-    if (!testMode)
+    /* ---- 让"长阻塞"不再冲掉主机数据（报告 B P1-2 / P2-2） ----------------------------
+     * display() 内部的帧边界等待最长 40 ms（FRAME_SYNC_TIMEOUT_MS），期间只调平台的
+     * service()，**不会**排空 SSD1306 从机的环形缓冲 —— 而 16 KB 环在 4 MHz 下只有
+     * 8.2 ms 容量 ⇒ 主机持续送帧时会被冲掉（实机观测：一次性 overrun=3 / drop=4263）。
+     * ⚠️ 注册点必须在**预热之前**（这里），而不是模拟器主循环里：否则"上电 → 进主循环"
+     *    之间的那次 display()（首帧全黑）仍然是不排水的窗口。见 docs/10 §7。 */
+    if (!testMode) {
+        display.setWaitServiceHook(serviceHostLink);
+#if !VFD_DUAL_CORE
+        gLastDrainUs = time_us_32(); /* 排水间隔监控的起点（避免首次数出一个"开机至今"的假间隔） */
+        gDrainGapMaxUs = 0;
+#endif
         startHostLink();
+    }
 
     /* init() + 空白帧 + **开始**上电时序，CPU 不阻塞：
      * 预热这 440 ms（20 + 400 + 20）里
@@ -1082,6 +1266,11 @@ int main()
     /* 启动时打印"总线顺序配置"：用串口即可确认板上跑的到底是哪一版固件 */
     bootPrintf("  wire: reverseBits=%d\n",
         platform.wireReversesByteBits() ? 1 : 0);
+    /* 固件指纹：`__DATE__ __TIME__` 每次重建都会变；后两项是本轮排水修复的标识
+     * （tick 的 RX 排空宏 + "帧边界等待期间会排水/诊断打印走 serviceLink"）。
+     * 排故时**先看这一行**就能确认板上跑的到底是哪一版固件。 */
+    bootPrintf("  fw: %s %s   rx drain(tick): topup=%d service=%d   wait-hook=on   print-drain=serviceLink\n",
+        __DATE__, __TIME__, VFD_TICK_RX_TOPUP, VFD_TICK_SERVICE_DRAIN);
     bootPrintf("  CLKa=GP%u  SIa=GP%u  LAT=GP%u  CLKg=GP%u  SIg=GP%u  BK=GP%u  HVEN=GP%u  FLEN=GP%u\n",
         cfg.pin_clka, cfg.pin_sia, cfg.pin_lat, cfg.pin_clkg,
         cfg.pin_sig, cfg.pin_bk, cfg.pin_hv_en, cfg.pin_fl_en);

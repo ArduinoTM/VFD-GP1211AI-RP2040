@@ -119,6 +119,15 @@ public:
     bool debugTakeIrqFlag();                /* 读并清除 PIO IRQ0 标志（push 计数用） */
     uint32_t droppedCount() const { return _dropped; }
     uint32_t overrunCount() const { return _overruns; }
+    /* ---- 失步看护（本轮新增，报告 P1；见 task() 里的长注释与 docs/14 §5）----
+     * RX FIFO 顶满 ⇒ SM 卡在 `push` 上丢 SCLK 沿 ⇒ 之后整条流**位相位永久错位**。
+     * 硬件证据是 FDEBUG.RXSTALL（stalled()）。看护一旦看到它就把 SM/DMA 停掉、丢弃本帧剩余
+     * 字节，等 CS 抬起后 resetStream() 重新对齐 —— 把代价从"整帧花屏 + 显示状态被改坏"
+     * 降级为"丢一帧"。
+     * 正常收流时这两个计数**应恒为 0**；非 0 ⇒ 主机时钟太快 / 线材太差 / DMA 被抢占。 */
+    uint32_t stallResyncCount() const { return _stallResyncs; }
+    /* 其中"CS 一直不抬、超时强制重新对齐"的次数（CS 被接死低时的兜底，见 STALL_CS_WAIT_TIMEOUT_US）。 */
+    uint32_t stallForceResyncCount() const { return _stallForced; }
     uint32_t resetEvents() const { return _resetEvents; }
     bool resetAsserted() const { return _resetAsserted; }
     /* RESET 引脚由低变高的那次事件（应用应据此复位模拟器状态） */
@@ -154,7 +163,9 @@ public:
     uint32_t lapCount() const { return _laps; }
     /* PIO 是否因为 RX FIFO 满而卡住（DMA 跟不上时会置位，正常应为 false）。
      * ⚠️ FDEBUG 的 RXSTALL 是**粘性**位：本函数**读取即清除**，所以它回答的是
-     *    "自上次询问以来是否卡过"，而不是"此刻是否卡着"。正因如此它不能是 const。 */
+     *    "自上次询问以来是否卡过"，而不是"此刻是否卡着"。正因如此它不能是 const。
+     * ⚠️ 自 2026-10 起 task() 每轮都会调用它（失步看护），所以应用侧再调用时**几乎总是**
+     *    返回 false —— 要看"到底失步过几次"请读 stallResyncCount()。 */
     bool stalled();
 
 private:
@@ -193,6 +204,11 @@ private:
     bool _txnSeen;
     uint32_t _txnEnds;
     bool _pendingTxnEnd;
+    /* 失步看护（见 task()）：RXSTALL 一旦出现，位相位已经错位，本帧剩余字节全部丢弃 */
+    uint32_t _stallResyncs;      /* 看护触发次数（正常恒 0） */
+    uint32_t _stallForced;       /* 其中"等 CS 抬起超时"的强制对齐次数 */
+    bool _stallAbort;            /* 正在等待 CS 抬起以重新对齐 */
+    uint32_t _stallAbortSinceUs; /* 进入 _stallAbort 的时刻（有界等待用，time_us_32 基准） */
     bool _running;
     const char *_error;
 };

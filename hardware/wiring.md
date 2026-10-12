@@ -38,7 +38,7 @@ cmake -S . -B build -DPICO_SDK_PATH=/path/to/pico-sdk \
 | `CLKa` | 由 PIO sideset 产生；默认 4.5 MHz（`-DVFD_PIO_CLK_HZ`，须 ≤5 MHz） |
 | `SIa` | 由 PIO `out` 产生（LSB-first） |
 | `BK` | 仍是 PWM 输出，但 PIO 会**读取该引脚电平**用于同步，因此该 pad 的输入缓冲必须使能（代码已 `gpio_set_input_enabled`） |
-| `VFD_PIN_SEED_FLAG` | 默认 GP10：CPU 输出、PIO 用 `jmp pin` 回读，**不需要任何外部连线**，但请避开已在用的引脚 |
+| ~~`VFD_PIN_SEED_FLAG`~~ | **已删除**（2026-10-11）：帧末播种改由 CPU 在 DMA 完成中断里直接翻 SIg 电平，不再需要 `jmp pin` 回读的"播种请求脚"，`VFD_PIN_SEED_FLAG` 宏与相关代码已移除 |
 | DMA | PIO 引擎只用 1 个通道（`-DVFD_DMA_CH`，默认 0），不需要 RX 通道 |
 | 接线表 | **与 tick 引擎完全相同**，无需改线 |
 
@@ -137,7 +137,8 @@ BK→CLKg 相位，以及**采样间隔分布**（用来判断抓包是否丢样
    主机若在 RP2040 复位后立即发初始化序列 + 一帧（≈1 KB），N 应 ≥1050、overrun/drop 应为 0；
 2. 主机侧用示波器确认 SCK 空闲为低、数据在上升沿稳定（模式 0），DC 在整字节期间保持不变；
 3. 主机 `display()` 之后，日志里的 `rx=`/`data=` 计数应增加（每次整屏刷新 ≈1030 字节：
-   21 个初始化/窗口命令 + 1024 数据），`overrun=`/`drop=` 应保持 0，`stall=0`；
+   21 个初始化/窗口命令 + 1024 数据），`overrun=`/`drop=` 应保持 0，`stallfix=0`
+   （失步看护触发次数；2026-10 之前这个字段叫 `stall`，见 `docs/14` §5）；
 4. 若画面不更新：检查 `DC` 是否真的接在 `MOSI+1`；`begin()` 失败时日志会打印原因；
 5. `0x81`（对比度）命令会改变 VFD 亮度，可用来确认命令通路正常；
 6. 滚动联调：主机发 `0x26/0x27/0x29/0x2A` 后 `0x2F`，画面应开始按间隔平移（`0x2E` 停在当场）；

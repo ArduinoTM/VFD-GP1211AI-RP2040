@@ -175,7 +175,8 @@ void Rp2040Platform::init()
 /* tick 引擎走 SPI：PL022 只支持 MSB-first，而位映射按 LSB-first 设计
  * ⇒ 必须在打包后逐字节反序（见 vfd_scanpack.h 的说明）。
  * pio 引擎用 out pins（OSR 右移）= LSB-first，位序本来就对；
- * 但它的帧首播种顺序比手册/原驱动"晚一格"，用扫描相位 +1 在数据侧补偿。 */
+ * 但它的帧首播种顺序比手册/原驱动"晚一格"，用**扫描相位 −1**在数据侧补偿
+ * （固定值，旋钮已在 2026-10-08 清理中移除，见 vfd_scanpack.h §说明）。 */
 bool Rp2040Platform::wireReversesByteBits() const
 {
 #if VFD_SCAN_ENGINE_PIO

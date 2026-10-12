@@ -72,7 +72,9 @@ public:
     /* 主循环杂务（清 SPI RX FIFO 等），应在 loop() 中周期调用。 */
     virtual void service() = 0;
 
-    /* 扫描停摆后的恢复：重启定时器/SPI/DMA，并复位扫描序号。 */
+    /* 扫描停摆后的恢复：重启定时器/SPI/DMA/状态机。
+     * ⚠️ **不复位**扫描/帧序号（`scanCount()`/`frameStartCount()` 是单调心跳，
+     *    复位会让上层看护把"刚恢复"误判成"换了引擎"）。 */
     virtual void recover() = 0;
 
     virtual uint32_t millis() const = 0;
