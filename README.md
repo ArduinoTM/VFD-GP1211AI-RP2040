@@ -66,7 +66,7 @@ STM32F103 Arduino 驱动）**移植到 RP2040 / Raspberry Pi Pico（Pico SDK）*
 │  └─ compat/                  # Arduino 兼容层（让 Adafruit_GFX 在裸 Pico SDK 上编译）
 ├─ lib/Adafruit_GFX/           # vendor 的 Adafruit GFX v1.2.3（BSD，仅必需 4 文件）
 ├─ tests/                      # 宿主机测试（g++，无需嵌入式工具链）
-│  ├─ run_host_tests.ps1       # 一键跑：6 个测试程序（261 项 + 核间握手 79102 项）+ SDK 语法桩 + 6 个 .ino 语法
+│  ├─ run_host_tests.ps1       # 一键跑：6 个测试程序（289 项 + 核间握手 79102 项）+ SDK 语法桩 + 6 个 .ino 语法
 │  ├─ reference_pack.*         # 原驱动 display() 的 1:1 转录（位重排对照用）
 │  ├─ host_syntax/stub/        # Pico SDK 形状桩（让目标机源码能在 PC 上做 -fsyntax-only）
 │  ├─ host_syntax/stub_arduino/ # Arduino/Adafruit/u8g2 形状桩（给 examples/ 的 .ino 做语法检查）
@@ -81,13 +81,15 @@ STM32F103 Arduino 驱动）**移植到 RP2040 / Raspberry Pi Pico（Pico SDK）*
 ### 1) 宿主机测试（1 分钟，不需要任何嵌入式工具链）
 
 ```powershell
-powershell -File tests\run_host_tests.ps1      # 需要 g++/clang++（6 个程序：44+93+28+53+43 = 261 项，另加核间握手回归 79102 项）
+powershell -File tests\run_host_tests.ps1      # 需要 g++/clang++（6 个程序：44+121+28+53+43 = 289 项，另加核间握手回归 79102 项）
 ```
 
 跑的是**目标机同一份驱动源码**（`src/`），用一个模拟扫描引擎的 `MockPlatform`：
 位重排与原驱动 1:1 转录逐位对比、双射校验、双缓冲无撕裂回归、看护逻辑、示例画面 ASCII 预览；
-`ssd1306_host_tests.exe`（**93 项**）则覆盖 SSD1306 模拟核心（标准初始化+整屏写入 ⇒ 渲染与主机图像逐位一致、
-段/COM 镜像、三种寻址模式与窗口回绕、显示开关/全亮/反显/对比度、未知命令与跨调用拆分的参数、滚动）；
+`ssd1306_host_tests.exe`（**121 项**）则覆盖 SSD1306 模拟核心（标准初始化+整屏写入 ⇒ 渲染与主机图像逐位一致、
+段/COM 镜像、三种寻址模式与窗口回绕、显示开关/全亮/反显/对比度、未知命令与跨调用拆分的参数、滚动：
+参数个数按命令不同、垂直只上移、`0xA3` 滚动区、`0x2E` 停止后垂直复位而水平保留，以及
+**Adafruit_SSD1306 等主机库的真实滚动字节流回放**）；
 另有 `pio_seed_timing`（28 项：PIO 程序结构 + 边界四步 + 扫描相位模型）、
 `ssd1306_pio_host_tests`（53 项：从机 PIO 线上格式）、`master_phases_host_tests`（43 项：主控相位序列回放）
 与 `dualcore_handoff`（**79102 项**：双核核间 2 槽 SPSC 协议的全状态组合 —— 丢帧守卫、槽位轮换、最新帧选择）。
@@ -304,8 +306,10 @@ oled.display();      // 调一次即可，本机持续显示
 
 * 主机 SPI 用**模式 0**（CPOL=0, CPHA=0）；`DC` 必须接在 **MOSI 的下一个 GPIO**（GP12→GP13）；
 * 支持页/水平/垂直寻址、列页窗口、显示开关、全亮、反显、`0x81` 对比度（→ VFD 亮度）、RESET、
-  **滚动**（`0x26/0x27` 水平右/左、`0x29/0x2A` 垂直+水平、`0x2E/0x2F` 停止/启动；间隔按规格书
-  帧数表，1 帧折算 8 ms）——详见 `docs/综合技术报告.md` §5；
+  **滚动**（`0x26/0x27` 水平右/左 = 6 个参数、`0x29/0x2A` 垂直+水平 = **5 个参数**、`0x2E/0x2F` 停止/启动、
+  `0xA3` 垂直滚动区域；间隔按规格书帧数表，1 帧折算 8 ms）；
+  水平滚动**改写 GDDRAM**（`0x2E` 停止后位移保留），垂直滚动是**显示级上移**（`0x2E` 停止后上下自动复位、
+  只能向上）——详见 `docs/综合技术报告.md` §5；
   未知命令忽略并计数；
 * 段/COM 重映射按"标准模块"约定：库默认的 `0xA1`+`0xC8` 与主机缓冲**同向**（逐位一致）；
 * 内置测试图像只在 `VFD_PIN_TEST_MODE`（GP16）上电为低时渲染，用于点亮/时序自检；
@@ -370,7 +374,7 @@ oled.display();      // 调一次即可，本机持续显示
 
 | 工作流 | 触发 | 做什么 |
 |---|---|---|
-| [`ci.yml`](.github/workflows/ci.yml) | push 到 `main` / PR / 手动 | 跑宿主机测试（261 项 + 核间握手 79102 项 + SDK 语法桩 + 6 个 `.ino` 语法），并编译 **4 种固件组合**（tick / pio × 单核 / 双核），uf2 作为构建产物上传 |
+| [`ci.yml`](.github/workflows/ci.yml) | push 到 `main` / PR / 手动 | 跑宿主机测试（289 项 + 核间握手 79102 项 + SDK 语法桩 + 6 个 `.ino` 语法），并编译 **4 种固件组合**（tick / pio × 单核 / 双核），uf2 作为构建产物上传 |
 | [`release.yml`](.github/workflows/release.yml) | 推 `v*` 标签 / 手动 | 先跑测试，再编译同样 4 种组合，然后自动创建 GitHub Release 并把 4 个 uf2 附上（`-tick` / `-pio` / `-tick-dual` / `-pio-dual`，发布说明自动生成）|
 
 发版只需打标签：
