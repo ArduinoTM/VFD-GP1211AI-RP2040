@@ -62,6 +62,10 @@ void Ssd1306Emulator::reset()
     _scrollEndPage = 0;
     _scrollInterval = 0;
     _scrollVertOffset = 0;
+    /* 垂直滚动区域复位默认（规格书 0xA3：A 复位 0 行、B 复位 64 行 = 整个屏幕） */
+    _vAreaTopRows = 0;
+    _vAreaScrollRows = SSD1306_HEIGHT;
+    _vOffsetRows = 0;
     _scrollSteps = 0;
     _scrollLastMs = 0;
 }
@@ -91,13 +95,22 @@ uint8_t Ssd1306Emulator::paramCountOf(uint8_t cmd)
     case 0xA3: /* 垂直滚动区域（Set Vertical Scroll Area）：**必须吞掉 2 个参数**
                 * ⚠️ 以前漏登记 ⇒ 主机若发 `A3 00 3F`，那两个参数会被当成独立命令解析
                 *    （`0x00` 落在"设置低列地址"⇒ 写指针被挪走、画面错位），且永不自行纠正。
-                *    本模拟器仍不实现滚动区域（与 0xA8/0xDA 同类：只记录/忽略），但参数必须吃掉。 */
+                *    现在这两个参数**有语义**：A = 顶部固定行数（复位 0）、B = 滚动区行数（复位 64），
+                *    见 applyCommand() 的 0xA3 分支与 docs/05 §3.6。 */
         return 2;
-    case 0x26: /* 水平滚动设置 */
+    case 0x26: /* 水平滚动设置（右/左）：**6 个参数**
+                * 主机库实际字节流：`26|27 00 <起始页> <间隔> <结束页> 00 FF` + `2F` */
     case 0x27:
-    case 0x29: /* 垂直+水平滚动设置 */
-    case 0x2A:
         return 6;
+    case 0x29: /* 垂直+水平滚动设置（右/左）：**5 个参数**（结尾没有第二个空字节！）
+                * 三个独立实现一致：Adafruit_SSD1306 2.5.17（`29|2A 00 <起始页> <间隔> <结束页> 01`
+                * 之后**紧接** `2F`）、dotnet/iot `ContinuousVerticalAndHorizontalScrollSetup`
+                * （Id,0x00,start,rate,end,vertOffset）、Parallax badgewxtools `oled_scrollRightDiag.c`。
+                * ⚠️ 以前按 6 个参数登记 ⇒ 主机紧跟的 `2F`（启动滚动）被当成第 6 个参数吃掉，
+                *    滚动**永不启动**：水平滚动能动、斜向/垂直一动不动（现场症状）。
+                *    规格书表格里 0x29/0x2A 只有 A..E 五个参数（E = 垂直偏移）。 */
+    case 0x2A:
+        return 5;
     default:
         return 0;
     }
@@ -213,8 +226,13 @@ void Ssd1306Emulator::handleCommand(uint8_t cmd)
         _comScanReversed = true;
         _dirty = true;
         return;
-    case 0x2E: /* 停止滚动 */
+    case 0x2E: /* 停止滚动：水平位移留在 GDDRAM 里（真机 0x2E 后仍需重写 RAM），
+                * 而**垂直是显示级偏移 ⇒ 归零**（现场可见"上下位置自动复位、左右保留"）。 */
         _scrollActive = false;
+        if (_vOffsetRows != 0) {
+            _vOffsetRows = 0;
+            _dirty = true; /* 复位本身也要重绘，否则画面停在旧位置 */
+        }
         return;
     case 0x2F: /* 启动滚动（未配置过则忽略，与真实芯片一致） */
         if (_scrollConfigured && _scrollMode != SCROLL_OFF) {
@@ -285,8 +303,28 @@ void Ssd1306Emulator::applyCommand(uint8_t cmd)
     case 0xD9:
     case 0xDA:
     case 0xDB:
-    case 0xA3: /* 垂直滚动区域：只吞参数（不实现），见 paramCountOf() 的说明 */
         break;
+    case 0xA3: { /* 垂直滚动区域：A = 顶部固定行数（复位 0）、B = 滚动区行数（复位 64）
+                  * 滚动区从"顶部固定区的下一行"开始，区外的行在垂直方向固定不动。
+                  * 本模拟器按规格书复位默认实现"全区滚动"，并支持局部区域（见 docs/05 §3.6）。 */
+        uint8_t a = static_cast<uint8_t>(_params[0] & 0x3F); /* A[5:0] */
+        uint8_t b = static_cast<uint8_t>(_params[1] & 0x7F); /* B[6:0] */
+        if (a >= SSD1306_HEIGHT)
+            a = 0;
+        if (b == 0 || b > SSD1306_HEIGHT)
+            b = static_cast<uint8_t>(SSD1306_HEIGHT - a); /* 异常/越界收敛，保证区非空 */
+        if (static_cast<int>(a) + static_cast<int>(b) > SSD1306_HEIGHT)
+            b = static_cast<uint8_t>(SSD1306_HEIGHT - a);
+        if (b == 0) {
+            a = 0;
+            b = SSD1306_HEIGHT;
+        }
+        _vAreaTopRows = a;
+        _vAreaScrollRows = b;
+        _vOffsetRows = 0; /* 重新划分区域 ⇒ 垂直位置归零（与 0x2E 同理：偏移是显示级的） */
+        _dirty = true;
+        break;
+    }
     default:
         _unknownCount++;
         break;
@@ -352,7 +390,16 @@ void Ssd1306Emulator::renderToFramebuffer(uint8_t *framebuffer) const
                 if (((bits >> b) & 1u) == 0)
                     continue;
                 /* GDDRAM 行（0..63，D0 在页顶） */
-                const int row = page * 8 + b;
+                int row = page * 8 + b;
+                /* 垂直滚动（0x29/0x2A）：**显示级**行偏移，只在 0xA3 定义的滚动区内循环上移；
+                 * 区外的行（顶部/底部固定区）不动。GDDRAM 不被改写 —— 这正是真机上
+                 * "0x2E 停止后上下位置自动复位、左右位移保留"的原因（见 docs/05 §3.6）。 */
+                if (_vOffsetRows != 0 && _vAreaScrollRows > 0) {
+                    const int top = _vAreaTopRows;
+                    const int rows = _vAreaScrollRows;
+                    if (row >= top && row < top + rows)
+                        row = top + (((row - top) - _vOffsetRows) % rows + rows) % rows;
+                }
                 /* 显示偏移（0xD3）：整幅上移 offset 行 */
                 const int shifted = (row - _offset) & (SSD1306_HEIGHT - 1);
                 /* COM 扫描方向：0xC8 为正常方向 */
@@ -382,12 +429,18 @@ bool Ssd1306Emulator::shouldRender(uint32_t nowMs, uint32_t minIntervalMs)
 /* ------------------------------------------------------------------ 滚动 */
 
 /*
- * SSD1306 的滚动是"硬件改写 GDDRAM"：显示内容在【页窗口】内循环平移，
- * 移出窗口的数据从另一侧回到窗口（因此是循环滚动，不会丢内容）。
- * 参数布局（6 个参数，均以 DC=0 传输）：
+ * SSD1306 的滚动由**两条不同的通路**组成（与真机对齐的关键）：
+ *   · 水平 = **改写 GDDRAM**：页窗口内每页循环平移 1 列，移出的列从另一侧回到窗口。
+ *     因此 `0x2E` 停止之后水平位移仍留在显存里 —— 规格书正是这么写的：
+ *     "使用 2Eh 命令关闭滚屏动作后，RAM 的数据需要重写"。
+ *   · 垂直 = **显示级行偏移**：0x29/0x2A 每步把内容在 0xA3 定义的滚动区内上移 E 行（循环），
+ *     GDDRAM 一个字节都不动。因此 `0x2E` 停止后**上下位置自动复位**，而左右保留
+ *     （现场实测现象：禁用垂直滚动时画面上下回到原位、左右位移还在）。
+ * 参数布局（均以 DC=0 传输；**个数按命令不同**，见 paramCountOf()）：
  *   [0] 空字节         [1] 起始页        [2] 间隔（0..7 → 帧数见 SSD1306_SCROLL_STEP_FRAMES）
- *   [3] 结束页         [4] 垂直偏移      [5] 空字节
- * 0x26/0x27 = 纯水平（右/左），0x29/0x2A = 垂直+水平（右/左）。
+ *   [3] 结束页         [4] 垂直偏移（仅 0x29/0x2A 有）         [5] 空字节（仅 0x26/0x27 有）
+ *   0x26/0x27 = 纯水平（右/左）= 6 个参数；0x29/0x2A = 垂直+水平（右/左）= **5 个参数**。
+ *   主机库随后紧跟一条 `0x2F`（启动滚动）——这正是 0x29/0x2A 只能吞 5 个参数的原因。
  * 时间基准：1 帧 = 8 ms（本机 VFD 123 Hz 帧周期；真实芯片由内部振荡器与分频决定，量级相同）。
  */
 void Ssd1306Emulator::applyScrollCommand(uint8_t cmd)
@@ -426,47 +479,15 @@ void Ssd1306Emulator::scrollHorizontal(bool right)
     }
 }
 
-void Ssd1306Emulator::scrollVertical(uint8_t rows)
-{
-    const uint8_t pageCount = static_cast<uint8_t>(_scrollEndPage - _scrollStartPage + 1);
-    const uint8_t rowCount = static_cast<uint8_t>(pageCount * 8); /* 8..64 */
-    const uint8_t shift = static_cast<uint8_t>(rows % rowCount);
-    if (shift == 0)
-        return;
-
-    for (int x = 0; x < SSD1306_WIDTH; ++x) {
-        /* 把该列在窗口内的 rowCount 位取成位向量（bit r = 窗口内第 r 行） */
-        uint64_t col = 0;
-        for (uint8_t r = 0; r < rowCount; ++r) {
-            const uint8_t page = static_cast<uint8_t>(_scrollStartPage + (r >> 3));
-            const uint8_t bit = static_cast<uint8_t>(r & 7);
-            if ((_gdram[page * SSD1306_WIDTH + x] >> bit) & 1u)
-                col |= (static_cast<uint64_t>(1) << r);
-        }
-
-        /* 内容下移 shift 行：new[r] = old[r-shift] ⇒ 位向量左旋 shift */
-        col = (col << shift) | (col >> (rowCount - shift));
-
-        /* 写回窗口内该列的全部行 */
-        for (uint8_t r = 0; r < rowCount; ++r) {
-            const uint8_t page = static_cast<uint8_t>(_scrollStartPage + (r >> 3));
-            const uint8_t bit = static_cast<uint8_t>(r & 7);
-            uint8_t &cell = _gdram[page * SSD1306_WIDTH + x];
-            if ((col >> r) & 1u)
-                cell |= static_cast<uint8_t>(1u << bit);
-            else
-                cell &= static_cast<uint8_t>(~(1u << bit));
-        }
-    }
-}
-
 void Ssd1306Emulator::scrollStep()
 {
     _scrollSteps++;
-    if (_scrollMode == SCROLL_VERTICAL_HORIZONTAL)
-        scrollVertical(_scrollVertOffset);
+    /* 垂直分量：只累加**显示级**偏移，不碰 GDDRAM（见成员注释）。
+     * 因此 0x2E 一停，垂直位置自动复位，而水平位移留在显存里继续可见。 */
+    if (_scrollMode == SCROLL_VERTICAL_HORIZONTAL && _vAreaScrollRows > 0)
+        _vOffsetRows = static_cast<uint8_t>((_vOffsetRows + _scrollVertOffset) % _vAreaScrollRows);
     if (_scrollMode != SCROLL_OFF)
-        scrollHorizontal(_scrollRight);
+        scrollHorizontal(_scrollRight); /* 水平：真机确实改写 GDDRAM（所以 0x2E 后仍在） */
     _dirty = true;
 }
 

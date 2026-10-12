@@ -662,12 +662,14 @@ static void runSsd1306EmulatorLoop(VFD_GP1211AI &display, vfd::Rp2040Platform &p
                 printChunked(slave, emu, true, "%s", line);
             }
                 gPhase = "p:scroll"; /* 诊断相位标签：gapmax 用它点名是哪一行 */
-            printChunked(slave, emu, true, "         scroll: active=%d mode=%d %s pages=%u-%u interval=%u(%lu ms/step) v=%u steps=%lu\n",
+            printChunked(slave, emu, true, "         scroll: active=%d mode=%d %s pages=%u-%u interval=%u(%lu ms/step) v=%u voff=%u area=%u+%u steps=%lu\n",
                 emu.scrollActive() ? 1 : 0, static_cast<int>(emu.scrollMode()),
                 emu.scrollRight() ? "right" : "left",
                 emu.scrollStartPage(), emu.scrollEndPage(), emu.scrollInterval(),
                 static_cast<unsigned long>(emu.scrollPeriodMs()),
                 emu.scrollVerticalOffset(),
+                emu.scrollVerticalPosition(),
+                emu.scrollVerticalAreaTop(), emu.scrollVerticalAreaRows(),
                 static_cast<unsigned long>(emu.scrollStepCount()));
 
             /* ---- 接线诊断（只读）---- */
@@ -1104,12 +1106,14 @@ static void runSsd1306EmulatorLoopDualCore(VFD_GP1211AI &display, vfd::Rp2040Pla
                 diagWrite(line, (size_t)n);
                 diagFlush();
             }
-            printChunked(slave, emu, false, "         scroll: active=%d mode=%d %s pages=%u-%u interval=%u(%lu ms/step) v=%u steps=%lu\n",
+            printChunked(slave, emu, false, "         scroll: active=%d mode=%d %s pages=%u-%u interval=%u(%lu ms/step) v=%u voff=%u area=%u+%u steps=%lu\n",
                 emu.scrollActive() ? 1 : 0, static_cast<int>(emu.scrollMode()),
                 emu.scrollRight() ? "right" : "left",
                 emu.scrollStartPage(), emu.scrollEndPage(), emu.scrollInterval(),
                 static_cast<unsigned long>(emu.scrollPeriodMs()),
                 emu.scrollVerticalOffset(),
+                emu.scrollVerticalPosition(),
+                emu.scrollVerticalAreaTop(), emu.scrollVerticalAreaRows(),
                 static_cast<unsigned long>(emu.scrollStepCount()));
             /* 口径 A：每核忙时占比（中断 / core0 实事 / core1 排水 / core1 渲染）。
              * 单位换算：1% = 10000 µs；pctStr() 输出一位小数。 */

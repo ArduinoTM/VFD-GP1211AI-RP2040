@@ -301,16 +301,29 @@ static void phContrastSweep()
 }
 
 /* ------------------------------------------------------------------ 相位 8 */
-/* 四种硬件滚动：0x26/0x27/0x29/0x2A 设置 + 0x2F 启动 / 0x2E 停止 */
+/* 四种硬件滚动：0x26/0x27（**6 个参数**）、0x29/0x2A（**5 个参数**）设置 + 0x2F 启动 / 0x2E 停止。
+ * ⚠️ 参数个数按命令不同：0x29/0x2A 结尾**没有**第二个空字节 —— 主机多发的那个字节会被从机当成
+ *    一条命令（0xFF = 未知命令）。这与 Adafruit_SSD1306 / dotnet-iot / Parallax 的字节流一致，
+ *    见 docs/05 §3.6。 */
 static void phScroll()
 {
     static const uint8_t modes[4] = { 0x26, 0x27, 0x29, 0x2A };
-    static const char *names[4] = { "0x26 右滚", "0x27 左滚", "0x29 右下滚", "0x2A 左下滚" };
+    static const char *names[4] = { "0x26 右滚", "0x27 左滚", "0x29 右上滚", "0x2A 左上滚" };
 
     for (int i = 0; i < 4; ++i) {
-        const uint8_t set[7] = { modes[i], 0x00, 0x00, 0x07, 0x07, 0x00, 0xFF };
-        /* 参数：空字节, 起始页=0, 间隔=7(2 帧=16 ms), 结束页=7, 垂直偏移=0, 空字节 */
-        sendCmds(set, sizeof(set));
+        const bool diag = (modes[i] == 0x29 || modes[i] == 0x2A);
+        /* 0x26/0x27：空字节, 起始页=0, 间隔=7(2 帧=16 ms), 结束页=7, 空字节, 空字节 */
+        const uint8_t setH[7] = { modes[i], 0x00, 0x00, 0x07, 0x07, 0x00, 0xFF };
+        /* 0x29/0x2A：空字节, 起始页=0, 间隔=7, 结束页=7, 垂直偏移=1（结尾没有空字节） */
+        const uint8_t setD[6] = { modes[i], 0x00, 0x00, 0x07, 0x07, 0x01 };
+        if (diag) {
+            /* 与主机库一致：斜向滚动前先设垂直滚动区域（顶固定 0 行、滚动区 64 行） */
+            const uint8_t area[3] = { 0xA3, 0x00, 0x40 };
+            sendCmds(area, sizeof(area));
+            sendCmds(setD, sizeof(setD));
+        } else {
+            sendCmds(setH, sizeof(setH));
+        }
         sendOne(0x2F);            /* 启动 */
         logf("  %s：启动，观察 1.2 s（从机 steps 应增长、gdram_crc 在变）", names[i]);
         delay(1200);

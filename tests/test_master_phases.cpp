@@ -214,8 +214,20 @@ int main()
         uint32_t now = 1000;
         int changed = 0;
         for (int m = 0; m < 4; ++m) {
-            const uint8_t set[7] = { modes[m], 0x00, 0x00, 0x07, 0x07, 0x00, 0xFF };
-            cmds(set, sizeof(set));
+            const bool diag = (modes[m] == 0x29 || modes[m] == 0x2A);
+            if (diag) { /* 与主控 phScroll 一致：斜向滚动前先设垂直滚动区域 A3 00 40 */
+                const uint8_t area[3] = { 0xA3, 0x00, 0x40 };
+                cmds(area, sizeof(area));
+            }
+            /* 参数个数按命令不同（见 docs/05 §3.6）：
+             *   0x26/0x27 = 6 个（空字节,起始页,间隔,结束页,空字节,空字节）
+             *   0x29/0x2A = 5 个（空字节,起始页,间隔,结束页,垂直偏移）——结尾没有第二个空字节 */
+            const uint8_t setH[7] = { modes[m], 0x00, 0x00, 0x07, 0x07, 0x00, 0xFF };
+            const uint8_t setD[6] = { modes[m], 0x00, 0x00, 0x07, 0x07, 0x01 };
+            if (diag)
+                cmds(setD, sizeof(setD));
+            else
+                cmds(setH, sizeof(setH));
             cmd(0x2F); /* 启动 */
             const uint32_t crcBefore = emu.gdramCrc32();
             for (int k = 0; k < 75; ++k) { now += 16; emu.tick(now); }

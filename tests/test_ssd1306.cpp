@@ -155,6 +155,12 @@ static int comparePixels(const uint8_t *expect, const uint8_t *got, bool *firstM
     return diff;
 }
 
+/* 渲染缓冲 g_rendered 里 (x, y) 是否为亮点（垂直滚动是显示级偏移 ⇒ 只能从这里看） */
+static bool renderedPixel(int x, int y)
+{
+    return ((g_rendered[(y >> 3) * vfd::SSD1306_WIDTH + x] >> (y & 7)) & 1u) != 0;
+}
+
 /* 按 SSD1306 的段/COM 镜像生成"物理"图像（用于 A0/C0 场景的期望值） */
 static void mirrorHost(const uint8_t *src, uint8_t *dst, bool mirrorX, bool mirrorY)
 {
@@ -450,7 +456,9 @@ static void test_robustness()
 
 /* --------------------------------------------------------------- 滚动辅助 */
 
-/* 主机侧设置滚动：0x26/0x27（水平右/左）、0x29/0x2A（垂直+水平右/左），6 个参数 */
+/* 主机侧设置滚动：0x26/0x27（水平右/左）= **6 个参数**、0x29/0x2A（垂直+水平右/左）= **5 个参数**。
+ * 参数个数与三个独立实现的真实字节流一致（Adafruit_SSD1306 2.5.17、dotnet/iot、
+ * Parallax badgewxtools），见 docs/05 §3.6；0x29/0x2A 结尾**没有**第二个空字节。 */
 static void emuSetupScroll(vfd::Ssd1306Emulator &emu, uint8_t cmd, uint8_t startPage,
     uint8_t interval, uint8_t endPage, uint8_t vertOffset)
 {
@@ -459,8 +467,12 @@ static void emuSetupScroll(vfd::Ssd1306Emulator &emu, uint8_t cmd, uint8_t start
     emuCommand(emu, startPage);
     emuCommand(emu, interval);
     emuCommand(emu, endPage);
-    emuCommand(emu, vertOffset);
-    emuCommand(emu, 0x00); /* 空字节 */
+    if (cmd == 0x26 || cmd == 0x27) {
+        emuCommand(emu, 0x00); /* 空字节 */
+        emuCommand(emu, 0xFF); /* 空字节 */
+    } else {
+        emuCommand(emu, vertOffset); /* 垂直偏移（0x29/0x2A 的第 5 个也是最后一个参数） */
+    }
 }
 
 /* 参考实现（用索引映射，刻意与模拟器的 memmove 写法不同）：
@@ -571,36 +583,45 @@ static void test_scroll()
             "只滚动页 2..4，其它页保持不变");
     }
 
-    /* --- 7.7 0x29（垂直+水平）：单像素对角线移动与窗口内回绕 --- */
+    /* --- 7.7 0x29：水平改写 GDDRAM、垂直只是"显示级上移" --- */
     {
         vfd::Ssd1306Emulator e4;
-        e4.pushByte(0xAF, false); /* 显示开 */
+        emuStandardInit(e4, true); /* 显示开 */
         /* 在页 0..7 窗口内点亮 (10, 40) */
         memset(g_host, 0, sizeof(g_host));
         hostSetPixel(10, 40, true);
         emuWriteFullFrame(e4, g_host);
         emuSetupScroll(e4, 0x29, 0, 7, 7, /*vertOffset=*/3);
         check(e4.scrollVerticalOffset() == 3, "0x29 垂直偏移 = 3");
+        check(e4.scrollVerticalAreaTop() == 0 && e4.scrollVerticalAreaRows() == 64,
+            "未发 0xA3 时垂直滚动区取复位默认：顶固定 0 行 + 滚动区 64 行（全区）");
         e4.pushByte(0x2F, false);
         e4.tick(0);
         e4.tick(16);
 
-        const bool moved = ((e4.gdram()[(43 >> 3) * 128 + 11] >> (43 & 7)) & 1u) != 0;
-        const bool old = ((e4.gdram()[(40 >> 3) * 128 + 10] >> (40 & 7)) & 1u) != 0;
-        check(moved && !old, "一步后像素从 (10,40) 移到 (11,43)：水平 +1、垂直下移 3");
+        /* GDDRAM：只有水平位移（列 10 → 11），行不动 —— 这是"垂直是显示级"的直接证据 */
+        const bool ramMoved = ((e4.gdram()[(40 >> 3) * 128 + 11] >> (40 & 7)) & 1u) != 0;
+        const bool ramOld = ((e4.gdram()[(40 >> 3) * 128 + 10] >> (40 & 7)) & 1u) != 0;
+        check(ramMoved && !ramOld, "GDDRAM 只被水平改写：(10,40) → (11,40)（垂直不碰显存）");
 
-        /* 窗口底部回绕：改从 (100, 62) 出发，下移 3 行 → 绕到行 1 */
+        /* 渲染：水平 +1、垂直**上移** 3（真机只往上走） */
+        e4.renderToFramebuffer(g_rendered);
+        check(renderedPixel(11, 37) && !renderedPixel(11, 40),
+            "渲染后像素在 (11,37)：水平 +1、垂直上移 3");
+        check(e4.scrollVerticalPosition() == 3, "累计垂直位移 = 3 行（显示级）");
+
+        /* 滚动区内回绕：改从 (100, 2) 出发，上移 3 行 → 绕到行 63 */
         vfd::Ssd1306Emulator e5;
-        e5.pushByte(0xAF, false);
+        emuStandardInit(e5, true);
         memset(g_host, 0, sizeof(g_host));
-        hostSetPixel(100, 62, true);
+        hostSetPixel(100, 2, true);
         emuWriteFullFrame(e5, g_host);
         emuSetupScroll(e5, 0x29, 0, 7, 7, 3);
         e5.pushByte(0x2F, false);
         e5.tick(0);
         e5.tick(16);
-        const bool wrapped = ((e5.gdram()[(1 >> 3) * 128 + 101] >> (1 & 7)) & 1u) != 0;
-        check(wrapped, "垂直方向在页窗口内循环回绕（62 + 3 → 1）");
+        e5.renderToFramebuffer(g_rendered);
+        check(renderedPixel(101, 63), "垂直方向在滚动区内循环回绕（2 − 3 → 63，顶部绕到底部）");
     }
 
     /* --- 7.8 异常参数收敛：垂直偏移 0 → 1；结束页 < 起始页 → 收敛为起始页 --- */
@@ -637,6 +658,158 @@ static void test_scroll()
         e8.renderToFramebuffer(g_rendered);
         check(comparePixels(expR, g_rendered, nullptr) == 0,
             "滚动 4 步后渲染出的图像 == 滚动后的期望图像（逐位）");
+    }
+
+    /* --- 7.11 主机库真实字节流回放（Adafruit_SSD1306 2.5.17）---
+     * 字节流原样取自 vendor 的库源码（`repos/Adafruit_SSD1306/Adafruit_SSD1306.cpp`）：
+     *   startscrollright/left     : `26|27 00 <起始页> <间隔> <结束页> 00 FF` 然后 `2F`  ⇒ 6 个参数
+     *   startscrolldiagright/left : `A3 00 40` + `29|2A 00 <起始页> <间隔> <结束页> 01` 然后 `2F` ⇒ **5 个参数**
+     * 关键判据：紧跟其后的 `2F`（启动滚动）**不能被当成参数吃掉**。
+     * 曾经的 bug：0x29/0x2A 按 6 个参数吞 ⇒ `2F` 被吃掉 ⇒ 斜向/垂直滚动一动不动（而水平滚动正常）。 */
+    {
+        static const uint8_t modes[4] = { 0x26, 0x27, 0x29, 0x2A };
+        static const char *names[4] = { "0x26 水平右", "0x27 水平左", "0x29 斜向右", "0x2A 斜向左" };
+
+        for (int m = 0; m < 4; ++m) {
+            vfd::Ssd1306Emulator e;
+            hostPattern(0);
+            emuWriteFullFrame(e, g_host);
+
+            const bool diag = (modes[m] == 0x29 || modes[m] == 0x2A);
+            if (diag) { /* 斜向：库先设垂直滚动区域（顶固定 0 行、滚动区 HEIGHT 行） */
+                emuCommand(e, 0xA3);
+                emuCommand(e, 0x00);
+                emuCommand(e, vfd::SSD1306_HEIGHT);
+            }
+            emuCommand(e, modes[m]);
+            emuCommand(e, 0x00);               /* 空字节 */
+            emuCommand(e, 0x00);               /* 起始页 0 */
+            emuCommand(e, 0x00);               /* 间隔 0（= 5 帧/步 = 40 ms） */
+            emuCommand(e, 0x0F);               /* 结束页（库调用 startscroll*(0x00, 0x0F)） */
+            emuCommand(e, diag ? 0x01 : 0x00); /* 垂直偏移（斜向）／空字节（水平） */
+            if (!diag)
+                emuCommand(e, 0xFF);           /* 空字节：水平命令的第 6 个参数 */
+            emuCommand(e, 0x2F);               /* 启动 —— 这一条绝不能被当成参数 */
+
+            char msg[128];
+            snprintf(msg, sizeof(msg), "%s：库字节流之后 0x2F 仍被当作命令（滚动已启动）", names[m]);
+            check(e.scrollActive(), msg);
+
+            if (diag) {
+                snprintf(msg, sizeof(msg), "%s：垂直偏移 = 1、结束页 0x0F→7、间隔 0 ⇒ 40 ms/步", names[m]);
+                check(e.scrollVerticalOffset() == 1 && e.scrollEndPage() == 7 && e.scrollPeriodMs() == 40,
+                    msg);
+            }
+
+            const uint32_t crcBefore = e.gdramCrc32();
+            const uint32_t stepsBefore = e.scrollStepCount();
+            e.tick(1000);
+            e.tick(1000 + 40 * 3 + 1); /* 121 ms ⇒ 恰好 3 步 */
+            snprintf(msg, sizeof(msg), "%s：3 步之后 GDDRAM 被改写（画面确实在动）", names[m]);
+            check(e.scrollStepCount() == stepsBefore + 3 && e.gdramCrc32() != crcBefore, msg);
+        }
+
+        /* 单像素追踪（与上/下方向无关，方向本身由 §7.7 锁死）：
+         * 斜向滚动一步后**既有水平位移、也有垂直位移** —— 这是"斜向"的最低要求。 */
+        vfd::Ssd1306Emulator e9;
+        emuStandardInit(e9, true);
+        memset(g_host, 0, sizeof(g_host));
+        hostSetPixel(10, 40, true);
+        emuWriteFullFrame(e9, g_host);
+        emuCommand(e9, 0xA3); emuCommand(e9, 0x00); emuCommand(e9, 0x40);
+        emuCommand(e9, 0x29);
+        emuCommand(e9, 0x00); emuCommand(e9, 0x00); emuCommand(e9, 0x00);
+        emuCommand(e9, 0x07); emuCommand(e9, 0x01);
+        emuCommand(e9, 0x2F);
+        e9.tick(0);
+        e9.tick(41);
+        int px = -1, py = -1;
+        for (int page = 0; page < 8; ++page)
+            for (int col = 0; col < 128; ++col) {
+                const uint8_t v = e9.gdram()[page * 128 + col];
+                if (v)
+                    for (int bit = 0; bit < 8; ++bit)
+                        if ((v >> bit) & 1u) { px = col; py = page * 8 + bit; }
+            }
+        check(px == 11 && py == 40,
+            "斜向一步：GDDRAM 只有水平位移（(10,40) → (11,40)）—— 垂直是显示级偏移");
+        e9.renderToFramebuffer(g_rendered);
+        check(renderedPixel(11, 39),
+            "同一帧渲染后像素在 (11,39)：垂直上移 1 行（0x29 的垂直偏移 = 1）");
+    }
+
+    /* --- 7.12 0x2E 停止：垂直位置**自动复位**、水平位移保留（用户上机实测的真机行为）---
+     * 机制：水平滚动改写 GDDRAM（规格书：0x2E 后 RAM 需重写 ⇒ 位移留在显存里），
+     *       垂直滚动只是显示级行偏移（0x2E 停止时被清掉 ⇒ 画面上下回到原位）。 */
+    {
+        vfd::Ssd1306Emulator e10;
+        emuStandardInit(e10, true);
+        memset(g_host, 0, sizeof(g_host));
+        hostSetPixel(10, 40, true);
+        emuWriteFullFrame(e10, g_host);
+        emuSetupScroll(e10, 0x29, 0, 7, 7, /*vertOffset=*/2);
+        e10.pushByte(0x2F, false);
+        e10.tick(0);
+        e10.tick(16 * 5 + 1); /* 5 步 */
+        check(e10.scrollVerticalPosition() == 10, "5 步 × 垂直偏移 2 ⇒ 累计垂直位移 10 行");
+        e10.renderToFramebuffer(g_rendered);
+        check(renderedPixel(15, 30), "滚动中渲染：(10,40) → (15,30)（水平 +5、上移 10）");
+
+        uint8_t ramAtStop[vfd::SSD1306_GDDRAM_SIZE];
+        memcpy(ramAtStop, e10.gdram(), sizeof(ramAtStop));
+
+        emuCommand(e10, 0x2E); /* 停止滚动 */
+        check(!e10.scrollActive(), "0x2E 停止滚动");
+        check(e10.scrollVerticalPosition() == 0, "0x2E 把累计垂直位移归零（显示级偏移被清掉）");
+        check(memcmp(e10.gdram(), ramAtStop, sizeof(ramAtStop)) == 0,
+            "0x2E 不改 GDDRAM ⇒ 水平位移保留（真机上左右不回弹）");
+        check(e10.dirty(), "0x2E 的复位会置 dirty（不置脏就看不到上下复位）");
+
+        e10.renderToFramebuffer(g_rendered);
+        check(renderedPixel(15, 40) && !renderedPixel(15, 30),
+            "停止后渲染：像素回到行 40（上下复位）、列仍是 15（左右保留）");
+    }
+
+    /* --- 7.13 0xA3 垂直滚动区：区内上移循环、区外固定不动 --- */
+    {
+        vfd::Ssd1306Emulator e11;
+        emuStandardInit(e11, true);
+        memset(g_host, 0, sizeof(g_host));
+        hostSetPixel(10, 4, true);  /* 顶部固定区 */
+        hostSetPixel(20, 20, true); /* 滚动区内（16..31） */
+        hostSetPixel(30, 50, true); /* 底部固定区 */
+        emuWriteFullFrame(e11, g_host);
+        /* 0xA3 A=0x10（顶部固定 16 行）、B=0x10（滚动区 16 行） */
+        emuCommand(e11, 0xA3);
+        emuCommand(e11, 0x10);
+        emuCommand(e11, 0x10);
+        check(e11.scrollVerticalAreaTop() == 16 && e11.scrollVerticalAreaRows() == 16,
+            "0xA3 0x10 0x10 ⇒ 顶部固定 16 行 + 滚动区 16 行");
+        check(e11.scrollVerticalPosition() == 0, "重新划分滚动区时垂直位置归零");
+
+        emuSetupScroll(e11, 0x29, 0, 7, 7, /*vertOffset=*/1);
+        e11.pushByte(0x2F, false);
+        e11.tick(0);
+        e11.tick(16 * 3 + 1); /* 3 步 ⇒ 水平 +3、垂直上移 3 */
+        e11.renderToFramebuffer(g_rendered);
+        check(renderedPixel(13, 4) && renderedPixel(33, 50),
+            "区外的行只做水平位移：(10,4) → (13,4)、(30,50) → (33,50)（垂直固定）");
+        check(renderedPixel(23, 17),
+            "滚动区内的 (20,20) 上移 3 行 ⇒ (23,17)（水平 +3、区内循环）");
+
+        /* 异常参数收敛：A + B 超过 64 ⇒ 截断；B = 0 ⇒ 收敛为全区 */
+        vfd::Ssd1306Emulator e12;
+        emuCommand(e12, 0xA3);
+        emuCommand(e12, 0x30);
+        emuCommand(e12, 0x3F);
+        check(e12.scrollVerticalAreaTop() == 48 && e12.scrollVerticalAreaRows() == 16,
+            "A + B > 64 时收敛：0x30 + 0x3F ⇒ 48 + 16");
+        vfd::Ssd1306Emulator e13;
+        emuCommand(e13, 0xA3);
+        emuCommand(e13, 0x00);
+        emuCommand(e13, 0x00);
+        check(e13.scrollVerticalAreaTop() == 0 && e13.scrollVerticalAreaRows() == 64,
+            "B = 0（非法）⇒ 收敛为全区（0 + 64）");
     }
 }
 

@@ -143,6 +143,12 @@ public:
     uint8_t scrollInterval() const { return _scrollInterval; }
     uint8_t scrollVerticalOffset() const { return _scrollVertOffset; }
     uint32_t scrollStepCount() const { return _scrollSteps; }
+    /* 垂直滚动区域（0xA3：顶部固定行数 A / 滚动区行数 B；复位默认 0 / 64 = 整个屏幕） */
+    uint8_t scrollVerticalAreaTop() const { return _vAreaTopRows; }
+    uint8_t scrollVerticalAreaRows() const { return _vAreaScrollRows; }
+    /* 累计的**显示级**垂直位移（行）：0x29/0x2A 每步加"垂直偏移"，`0x2E` 停止时归零
+     * （真机行为：0x2E 之后画面上下位置自动复位，而左右位移留在 GDDRAM 里 ⇒ 保留） */
+    uint8_t scrollVerticalPosition() const { return _vOffsetRows; }
     /* 当前配置下每步的间隔（ms）= 帧数 × 8 ms */
     uint32_t scrollPeriodMs() const;
 
@@ -156,10 +162,9 @@ private:
     static uint8_t paramCountOf(uint8_t cmd);
 
     /* 滚动 */
-    void applyScrollCommand(uint8_t cmd); /* 6 个参数收齐后配置滚动 */
-    void scrollStep();                    /* 执行一步（水平，或垂直+水平） */
-    void scrollHorizontal(bool right);    /* 页窗口内每页整体平移 1 列（循环） */
-    void scrollVertical(uint8_t rows);    /* 页窗口内整体下移 rows 行（循环） */
+    void applyScrollCommand(uint8_t cmd); /* 参数收齐后配置滚动（0x26/0x27 共 6 个，0x29/0x2A 共 5 个） */
+    void scrollStep();                    /* 执行一步：水平改写 GDDRAM，垂直只累加显示级偏移 */
+    void scrollHorizontal(bool right);    /* 页窗口内每页整体平移 1 列（循环，改写 GDDRAM） */
 
     static_assert(SSD1306_GDDRAM_SIZE == SSD1306_WIDTH * (SSD1306_HEIGHT / 8),
         "GDDRAM 必须正好是 宽 × 高/8 字节（页式布局）");
@@ -213,6 +218,12 @@ private:
     uint8_t _scrollEndPage;
     uint8_t _scrollInterval;
     uint8_t _scrollVertOffset;
+    /* 垂直滚动区域与显示级垂直位移：
+     *   水平滚动 = 改写 GDDRAM（所以 0x2E 停scroll后仍保留）；
+     *   垂直滚动 = 显示级行偏移，落在 0xA3 定义的滚动区内（所以 0x2E 一停就自动复位）。 */
+    uint8_t _vAreaTopRows;    /* 0xA3 A：顶部固定行数（复位 0） */
+    uint8_t _vAreaScrollRows; /* 0xA3 B：滚动区行数（复位 64 = 全区） */
+    uint8_t _vOffsetRows;     /* 0x29/0x2A 每步累加的垂直位移（行），0x2E 归零 */
     uint32_t _scrollSteps;
     uint32_t _scrollLastMs;
 };
