@@ -42,6 +42,7 @@ static void section(const char *title)
 /* 主机视角的 1bpp 帧缓冲：与 Adafruit_SSD1306 的 buffer[x + (y/8)*128] 相同 */
 static uint8_t g_host[vfd::SSD1306_GDDRAM_SIZE];
 static uint8_t g_rendered[vfd::SSD1306_GDDRAM_SIZE];
+static uint8_t g_expected[vfd::SSD1306_GDDRAM_SIZE];
 
 static void hostSetPixel(int x, int y, bool on)
 {
@@ -159,6 +160,50 @@ static int comparePixels(const uint8_t *expect, const uint8_t *got, bool *firstM
 static bool renderedPixel(int x, int y)
 {
     return ((g_rendered[(y >> 3) * vfd::SSD1306_WIDTH + x] >> (y & 7)) & 1u) != 0;
+}
+
+/* 渲染的**逐像素参考实现**（2026-10-14 之前的写法，故意保留"贵"的取模路径）。
+ * renderToFramebuffer() 现在把"0xA3 滚动区偏移 + 0xD3 显示偏移 + 0xC8 COM 方向"
+ * 合并成每次渲染只算一次的 64 项行映射表（原来逐像素算、含两次 `%` ⇒ M0+ 上
+ * 每次取模都是一次软件除法，满屏 8192 像素白吃约 3 ms）。这份参考实现用来逐字节锁住等价性。 */
+static void referenceRender(const vfd::Ssd1306Emulator &e, uint8_t *out)
+{
+    memset(out, 0, vfd::SSD1306_GDDRAM_SIZE);
+    if (!e.displayOn())
+        return;
+    if (e.entireDisplayOn()) {
+        memset(out, 0xFF, vfd::SSD1306_GDDRAM_SIZE);
+        return;
+    }
+
+    const uint8_t *gdram = e.gdram();
+    for (int page = 0; page < vfd::SSD1306_PAGES; ++page) {
+        for (int col = 0; col < vfd::SSD1306_WIDTH; ++col) {
+            const uint8_t bits = gdram[page * vfd::SSD1306_WIDTH + col];
+            if (bits == 0)
+                continue;
+            const int x = e.segmentRemap() ? col : (vfd::SSD1306_WIDTH - 1 - col);
+            for (int b = 0; b < 8; ++b) {
+                if (((bits >> b) & 1u) == 0)
+                    continue;
+                int row = page * 8 + b;
+                if (e.scrollVerticalPosition() != 0 && e.scrollVerticalAreaRows() > 0) {
+                    const int top = e.scrollVerticalAreaTop();
+                    const int rows = e.scrollVerticalAreaRows();
+                    if (row >= top && row < top + rows)
+                        row = top + (((row - top) - e.scrollVerticalPosition()) % rows + rows) % rows;
+                }
+                const int shifted = (row - e.displayOffset()) & (vfd::SSD1306_HEIGHT - 1);
+                const int y = e.comScanReversed() ? shifted : (vfd::SSD1306_HEIGHT - 1 - shifted);
+                out[(y >> 3) * vfd::SSD1306_WIDTH + x] |= static_cast<uint8_t>(1u << (y & 7));
+            }
+        }
+    }
+
+    if (e.inverse()) {
+        for (int i = 0; i < vfd::SSD1306_GDDRAM_SIZE; ++i)
+            out[i] = static_cast<uint8_t>(~out[i]);
+    }
 }
 
 /* 按 SSD1306 的段/COM 镜像生成"物理"图像（用于 A0/C0 场景的期望值） */
@@ -810,6 +855,62 @@ static void test_scroll()
         emuCommand(e13, 0x00);
         check(e13.scrollVerticalAreaTop() == 0 && e13.scrollVerticalAreaRows() == 64,
             "B = 0（非法）⇒ 收敛为全区（0 + 64）");
+    }
+
+    /* --- 7.14 渲染行映射表 vs 逐像素参考实现（性能修复的等价性锁） ---
+     * 3 种滚动区 × 2 种 0xD3 显示偏移 × 2 种 COM 方向 × 4 档滚动进度 = 48 组，
+     * 每组都要求整幅 1024 B 逐字节一致（含反显组合）。 */
+    {
+        const uint8_t areas[3][2] = { { 0x00, 0x40 }, { 0x10, 0x10 }, { 0x30, 0x10 } };
+        const uint8_t offsets[2] = { 0x00, 0x05 };
+        int cases = 0, mismatch = 0, firstBad = -1;
+
+        for (int ai = 0; ai < 3; ++ai) {
+            for (int oi = 0; oi < 2; ++oi) {
+                for (int com = 0; com < 2; ++com) {
+                    for (int steps = 0; steps < 4; ++steps) {
+                        for (int inv = 0; inv < 2; ++inv) {
+                            vfd::Ssd1306Emulator e;
+                            emuStandardInit(e, true);
+                            for (int i = 0; i < vfd::SSD1306_GDDRAM_SIZE; ++i)
+                                g_host[i] = static_cast<uint8_t>(i * 31 + 7); /* 稠密：每页都有位 */
+                            emuWriteFullFrame(e, g_host);
+                            if (com)
+                                emuCommand(e, 0xC0); /* 反向 COM 扫描 */
+                            if (inv)
+                                emuCommand(e, 0xA7); /* 反显 */
+                            if (offsets[oi] != 0) {
+                                emuCommand(e, 0xD3);
+                                emuCommand(e, offsets[oi]);
+                            }
+                            emuCommand(e, 0xA3);
+                            emuCommand(e, areas[ai][0]);
+                            emuCommand(e, areas[ai][1]);
+                            emuSetupScroll(e, 0x29, 0, 7, 7, /*vertOffset=*/1);
+                            e.pushByte(0x2F, false);
+                            e.tick(0);
+                            for (int s = 0; s < steps; ++s)
+                                e.tick(static_cast<uint32_t>(16 * (s + 1) + 1));
+
+                            e.renderToFramebuffer(g_rendered);
+                            referenceRender(e, g_expected);
+                            ++cases;
+                            if (memcmp(g_rendered, g_expected, vfd::SSD1306_GDDRAM_SIZE) != 0) {
+                                ++mismatch;
+                                if (firstBad < 0)
+                                    firstBad = ai * 32 + oi * 16 + com * 8 + steps * 2 + inv;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        printf("  行映射表等价性：%d 组（含 voff=0/滚动推进/0xD3/COM/反显），%d 组不一致%s\n",
+            cases, mismatch, firstBad < 0 ? "" : "（见上一行的首个不一致组号）");
+        if (firstBad >= 0)
+            printf("  首个不一致组号：%d\n", firstBad);
+        check(mismatch == 0,
+            "渲染行映射表 == 逐像素参考实现（48 组 × 2 反显，整幅逐字节）");
     }
 }
 

@@ -375,35 +375,50 @@ void Ssd1306Emulator::renderToFramebuffer(uint8_t *framebuffer) const
         return;
     }
 
+    /* GDDRAM 行 → 显示行：**每次渲染只算 64 项**的映射表。
+     *
+     * ⚠️ 2026-10-14 之前这几步是**逐像素**算的，其中垂直滚动那一步用了两次 `%`；
+     *    M0+ 没有除法指令 ⇒ 每次取模都是一次 `__aeabi_idivmod` 调用，满屏 8192 个像素
+     *    就白吃约 3 ms。实测（QEMU/Cortex-M0 + `-icount` 台架，1 指令 = 1 虚拟 ns）：
+     *      · 不动滚动（voff=0）：239.6k 指令 ≈ 1.92 ms/次
+     *      · 垂直滚动激活（voff≠0）：612.9k 指令 ≈ 4.90 ms/次（255%）
+     *    滚动步进 16 ms/步 ⇒ 约 62 次渲染/秒 ⇒ **4.90 ms × 62 ≈ 30% CPU**，
+     *    这正是上机 log 里 `CPU core0: … render=30%` 的来源。
+     * 现在把"0xA3 滚动区偏移 + 0xD3 显示偏移 + 0xC8 COM 方向"三步合并成一张 64 项表，
+     * 内层循环只剩一次查表（取模次数从 8192×2 降到 64×2）。 */
+    uint8_t yOf[SSD1306_HEIGHT];
+    const int areaTop = _vAreaTopRows;
+    const int areaRows = _vAreaScrollRows;
+    const bool areaActive = (_vOffsetRows != 0 && areaRows > 0);
+    for (int r = 0; r < SSD1306_HEIGHT; ++r) {
+        /* 垂直滚动（0x29/0x2A）：**显示级**行偏移，只在 0xA3 定义的滚动区内循环上移；
+         * 区外的行（顶部/底部固定区）不动。GDDRAM 不被改写 —— 这正是真机上
+         * "0x2E 停止后上下位置自动复位、左右位移保留"的原因（见 docs/05 §3.6）。 */
+        int row = r;
+        if (areaActive && row >= areaTop && row < areaTop + areaRows)
+            row = areaTop + (((row - areaTop) - _vOffsetRows) % areaRows + areaRows) % areaRows;
+        /* 显示偏移（0xD3）：整幅上移 offset 行 */
+        const int shifted = (row - _offset) & (SSD1306_HEIGHT - 1);
+        /* COM 扫描方向：0xC8 为正常方向 */
+        yOf[r] = static_cast<uint8_t>(_comScanReversed ? shifted : (SSD1306_HEIGHT - 1 - shifted));
+    }
+
     for (int page = 0; page < SSD1306_PAGES; ++page) {
+        const uint8_t *map = &yOf[page * 8]; /* 本页 8 行的显示行号 */
         for (int col = 0; col < SSD1306_WIDTH; ++col) {
             const uint8_t bits = _gdram[page * SSD1306_WIDTH + col];
             if (bits == 0)
                 continue;
 
-            /* 段重映射（0xA0/0xA1）与 COM 扫描方向（0xC0/0xC8）按**标准模块**约定解释：
-             * Adafruit_SSD1306 / u8g2 等库默认发送 0xA1 + 0xC8，此时主机缓冲与面板显示同向，
-             * 因此这里不做镜像；相反设置则镜像对应方向（等价于模块被翻转安装）。 */
+            /* 段重映射（0xA0/0xA1）按**标准模块**约定解释：Adafruit_SSD1306 / u8g2 等库
+             * 默认发送 0xA1 + 0xC8，此时主机缓冲与面板显示同向，因此这里不做镜像；
+             * 相反设置则镜像对应方向（等价于模块被翻转安装）。 */
             const int x = _segRemap ? col : (SSD1306_WIDTH - 1 - col);
 
             for (int b = 0; b < 8; ++b) {
                 if (((bits >> b) & 1u) == 0)
                     continue;
-                /* GDDRAM 行（0..63，D0 在页顶） */
-                int row = page * 8 + b;
-                /* 垂直滚动（0x29/0x2A）：**显示级**行偏移，只在 0xA3 定义的滚动区内循环上移；
-                 * 区外的行（顶部/底部固定区）不动。GDDRAM 不被改写 —— 这正是真机上
-                 * "0x2E 停止后上下位置自动复位、左右位移保留"的原因（见 docs/05 §3.6）。 */
-                if (_vOffsetRows != 0 && _vAreaScrollRows > 0) {
-                    const int top = _vAreaTopRows;
-                    const int rows = _vAreaScrollRows;
-                    if (row >= top && row < top + rows)
-                        row = top + (((row - top) - _vOffsetRows) % rows + rows) % rows;
-                }
-                /* 显示偏移（0xD3）：整幅上移 offset 行 */
-                const int shifted = (row - _offset) & (SSD1306_HEIGHT - 1);
-                /* COM 扫描方向：0xC8 为正常方向 */
-                const int y = _comScanReversed ? shifted : (SSD1306_HEIGHT - 1 - shifted);
+                const int y = map[b];
                 framebuffer[(y >> 3) * SSD1306_WIDTH + x] |= static_cast<uint8_t>(1u << (y & 7));
             }
         }

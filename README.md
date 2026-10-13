@@ -23,6 +23,11 @@ STM32F103 Arduino 驱动）**移植到 RP2040 / Raspberry Pi Pico（Pico SDK）*
 * 帧缓冲 1 KB + 双缓冲发送缓冲 2×2064 B；tick 引擎中断 CPU ≈2%，PIO 引擎 ≈0.06%
   （原驱动 ≈24% 忙等）。**双核可把 SSD1306 数据面整个搬到 core1**，core0 只剩时序与发布；
   占用率可用诊断里的 4 个子项（`core0_irq`/`core0_work` | `core1_drain`/`core1_render`）直接量出来
+* **性能（2026-10-14 实测，QEMU/Cortex-M0 + `-icount` 指令计数）**：帧缓冲 → 移位链的位重排改为
+  **表驱动 gather**（每帧 **124.4k → 43.9k 指令**，界面型内容；tick 的整帧位反序折进打包，
+  再省 27k 指令/帧）；SSD1306 模拟的渲染行映射改成"每次渲染只算 64 项"
+  （滚动中 **4.90 → 1.17 ms/次**）。单核上机（诊断开、屏幕横向+纵向滚动）实测：
+  `render` **30% → 6%**、>4 ms 的长排水间隔 **51 → 0**、四项忙时合计 75% → 61%
 * 完全符合手册关键条款：fCLK ≤ 5 MHz、CLK 空闲高（Note 7①）、
   传输期间 BK 不变（Note 7②③④）、桁间消隐 ≥5 µs（Note 16）
 * 自带**扫描心跳看护**：手册 Note 14 明确"栅极扫描停止可能永久损坏屏"，
@@ -66,7 +71,7 @@ STM32F103 Arduino 驱动）**移植到 RP2040 / Raspberry Pi Pico（Pico SDK）*
 │  └─ compat/                  # Arduino 兼容层（让 Adafruit_GFX 在裸 Pico SDK 上编译）
 ├─ lib/Adafruit_GFX/           # vendor 的 Adafruit GFX v1.2.3（BSD，仅必需 4 文件）
 ├─ tests/                      # 宿主机测试（g++，无需嵌入式工具链）
-│  ├─ run_host_tests.ps1       # 一键跑：6 个测试程序（289 项 + 核间握手 79102 项）+ SDK 语法桩 + 6 个 .ino 语法
+│  ├─ run_host_tests.ps1       # 一键跑：6 个测试程序（321 项 + 核间握手 79102 项）+ SDK 语法桩 + 6 个 .ino 语法
 │  ├─ reference_pack.*         # 原驱动 display() 的 1:1 转录（位重排对照用）
 │  ├─ host_syntax/stub/        # Pico SDK 形状桩（让目标机源码能在 PC 上做 -fsyntax-only）
 │  ├─ host_syntax/stub_arduino/ # Arduino/Adafruit/u8g2 形状桩（给 examples/ 的 .ino 做语法检查）
@@ -81,12 +86,12 @@ STM32F103 Arduino 驱动）**移植到 RP2040 / Raspberry Pi Pico（Pico SDK）*
 ### 1) 宿主机测试（1 分钟，不需要任何嵌入式工具链）
 
 ```powershell
-powershell -File tests\run_host_tests.ps1      # 需要 g++/clang++（6 个程序：44+121+28+53+43 = 289 项，另加核间握手回归 79102 项）
+powershell -File tests\run_host_tests.ps1      # 需要 g++/clang++（6 个程序：75+122+28+53+43 = 321 项，另加核间握手回归 79102 项）
 ```
 
 跑的是**目标机同一份驱动源码**（`src/`），用一个模拟扫描引擎的 `MockPlatform`：
 位重排与原驱动 1:1 转录逐位对比、双射校验、双缓冲无撕裂回归、看护逻辑、示例画面 ASCII 预览；
-`ssd1306_host_tests.exe`（**121 项**）则覆盖 SSD1306 模拟核心（标准初始化+整屏写入 ⇒ 渲染与主机图像逐位一致、
+`ssd1306_host_tests.exe`（**122 项**）则覆盖 SSD1306 模拟核心（标准初始化+整屏写入 ⇒ 渲染与主机图像逐位一致、
 段/COM 镜像、三种寻址模式与窗口回绕、显示开关/全亮/反显/对比度、未知命令与跨调用拆分的参数、滚动：
 参数个数按命令不同、垂直只上移、`0xA3` 滚动区、`0x2E` 停止后垂直复位而水平保留，以及
 **Adafruit_SSD1306 等主机库的真实滚动字节流回放**）；
@@ -374,7 +379,7 @@ oled.display();      // 调一次即可，本机持续显示
 
 | 工作流 | 触发 | 做什么 |
 |---|---|---|
-| [`ci.yml`](.github/workflows/ci.yml) | push 到 `main` / PR / 手动 | 跑宿主机测试（289 项 + 核间握手 79102 项 + SDK 语法桩 + 6 个 `.ino` 语法），并编译 **4 种固件组合**（tick / pio × 单核 / 双核），uf2 作为构建产物上传 |
+| [`ci.yml`](.github/workflows/ci.yml) | push 到 `main` / PR / 手动 | 跑宿主机测试（321 项 + 核间握手 79102 项 + SDK 语法桩 + 6 个 `.ino` 语法），并编译 **4 种固件组合**（tick / pio × 单核 / 双核），uf2 作为构建产物上传 |
 | [`release.yml`](.github/workflows/release.yml) | 推 `v*` 标签 / 手动 | 先跑测试，再编译同样 4 种组合，然后自动创建 GitHub Release 并把 4 个 uf2 附上（`-tick` / `-pio` / `-tick-dual` / `-pio-dual`，发布说明自动生成）|
 
 发版只需打标签：

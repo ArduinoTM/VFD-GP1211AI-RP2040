@@ -46,9 +46,11 @@ void VFD_GP1211AI::beginAsync(uint32_t preheat_ms)
     _platform.init();
     _platform.setBrightness(_brightness);
 
-    /* 先发布一帧合法（空白）数据，避免扫描引擎启动瞬间读到未初始化缓冲 */
-    vfd::packFrame(_framebuffer, _invert, _frameBuffer[0]);
-    vfd::wirePrepareFrame(_frameBuffer[0], _platform.wireReversesByteBits());
+    /* 先发布一帧合法（空白）数据，避免扫描引擎启动瞬间读到未初始化缓冲。
+     * 线序（tick 的 SPI 只能 MSB-first）在打包时就直接产出（wireOrder），
+     * wirePrepareFrame 只负责扫描相位 −1 —— 省掉整帧 2064 B 的逐字节反序遍历。 */
+    vfd::packFrame(_framebuffer, _invert, _frameBuffer[0], _platform.wireReversesByteBits());
+    vfd::wirePrepareFrame(_frameBuffer[0], false);
     _platform.publishFrame(_frameBuffer[0]);
     _lastSeq = _platform.frameStartCount();
     _published = true;
@@ -250,8 +252,8 @@ void VFD_GP1211AI::display()
     waitForFrameBoundary();
 
     uint8_t *dst = _frameBuffer[_writeIndex];
-    vfd::packFrame(_framebuffer, _invert, dst);
-    vfd::wirePrepareFrame(dst, _platform.wireReversesByteBits());
+    vfd::packFrame(_framebuffer, _invert, dst, _platform.wireReversesByteBits());
+    vfd::wirePrepareFrame(dst, false); /* 只做相位 −1：位序已在打包时按线序产出 */
 
     _lastSeq = _platform.frameStartCount();
     _platform.publishFrame(dst);

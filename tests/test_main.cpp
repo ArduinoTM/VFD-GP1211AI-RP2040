@@ -494,6 +494,201 @@ static void test_demo_screens()
     printAscii(display.framebuffer());
 }
 
+/* ------------------------------------------- 8：打包实现（表驱动 gather + 线序折进）
+ *
+ * 2026-10-13 起 `packScan()` 由"逐位 scatter"改为"表驱动 gather"，tick 的逐字节位反序也折进打包。
+ * 这里**保留旧的逐位 scatter 实现作为独立参考**（写法与生产实现完全不同，避免"自己证明自己"），
+ * 并把"折进线序"与"两步老路径"逐字节对比。依据：QEMU/Cortex-M0 + `-icount` 台架实测
+ * （每帧打包指令数 124.4k → 43.9k 等，见 docs/00 §4.2 的实测表）。 */
+
+static void packScanScatterRef(const uint8_t *fb, int scan, bool invert, uint8_t *out)
+{
+    memset(out, 0, vfd::SCAN_BYTES);
+    if (scan < 0 || scan >= vfd::SCANS_PER_FRAME)
+        return;
+
+    const int t = (vfd::SCANS_PER_FRAME - 1) - scan;
+    const int x0 = 3 * t;
+    const bool t43 = (t == 42);
+    const int off0 = t43 ? 2 : ((t & 1) ? 5 : 0);
+    const int offStep = t43 ? 2 : ((t & 1) ? -2 : 2);
+    const int kShift = t43 ? -2 : 0;
+    const int maxDx = t43 ? 2 : 3;
+
+    for (int page = 0; page < vfd::PAGES; ++page) {
+        for (int dx = 0; dx < maxDx; ++dx) {
+            const int x = x0 + dx;
+            if (x < 0 || x >= vfd::WIDTH)
+                continue;
+            uint8_t src = fb[page * vfd::WIDTH + x];
+            if (invert)
+                src = static_cast<uint8_t>(~src);
+            if (src == 0)
+                continue;
+            const int off = off0 + offStep * dx;
+            for (int m = 0; m < 8; ++m) {
+                if (((src >> m) & 1u) == 0)
+                    continue;
+                const int k = 48 * page + 6 * m + off + kShift;
+                if (k < 0 || k >= vfd::SCAN_BYTES * 8)
+                    continue;
+                out[k >> 3] |= static_cast<uint8_t>(1u << (k & 7));
+            }
+        }
+    }
+}
+
+static void packFrameScatterRef(const uint8_t *fb, bool invert, uint8_t *out)
+{
+    for (int s = 0; s < vfd::SCANS_PER_FRAME; ++s)
+        packScanScatterRef(fb, s, invert, out + s * vfd::SCAN_BYTES);
+}
+
+/* 6 种画面：全黑 / 全白 / 棋盘 / 随机 / 稀疏 / 每页每列恰好 1 位 */
+static void buildTestPicture(uint8_t *fb, int kind)
+{
+    switch (kind) {
+    case 0:
+        memset(fb, 0x00, vfd::FRAMEBUFFER_SIZE);
+        break;
+    case 1:
+        memset(fb, 0xFF, vfd::FRAMEBUFFER_SIZE);
+        break;
+    case 2:
+        for (int i = 0; i < vfd::FRAMEBUFFER_SIZE; ++i)
+            fb[i] = (i & 1) ? 0xAA : 0x55;
+        break;
+    case 3:
+        for (int i = 0; i < vfd::FRAMEBUFFER_SIZE; ++i)
+            fb[i] = static_cast<uint8_t>(rnd());
+        break;
+    case 4:
+        memset(fb, 0, vfd::FRAMEBUFFER_SIZE);
+        fb[3 * vfd::WIDTH + 5] = 0x01;
+        fb[0 * vfd::WIDTH + 127] = 0x80;
+        fb[7 * vfd::WIDTH + 0] = 0xFF;
+        break;
+    default:
+        for (int p = 0; p < vfd::PAGES; ++p)
+            for (int x = 0; x < vfd::WIDTH; ++x)
+                fb[p * vfd::WIDTH + x] = static_cast<uint8_t>(1u << ((x + p) & 7));
+        break;
+    }
+}
+
+static void test_pack_gather()
+{
+    section("8. 打包实现：表驱动 gather（vs 逐位 scatter）/ 线序折进 / 边界语义");
+
+    static uint8_t fb[vfd::FRAMEBUFFER_SIZE];
+    static uint8_t refOut[vfd::FRAME_SIZE];
+    static uint8_t newOut[vfd::FRAME_SIZE];
+    static uint8_t twoStep[vfd::FRAME_SIZE];
+
+    const char *picName[6] = { "全黑", "全白", "棋盘", "随机", "稀疏", "每列 1 位" };
+
+    /* 8.1 gather vs 逐位 scatter（6 画面 × invert，逐字节） */
+    for (int kind = 0; kind < 6; ++kind) {
+        for (int inv = 0; inv < 2; ++inv) {
+            buildTestPicture(fb, kind);
+            packFrameScatterRef(fb, inv != 0, refOut);
+            vfd::packFrame(fb, inv != 0, newOut, false);
+            char msg[96];
+            snprintf(msg, sizeof(msg), "%s%s：表驱动 gather == 逐位 scatter（2064 B 逐字节）",
+                picName[kind], inv ? " + invert" : "");
+            check(memcmp(refOut, newOut, vfd::FRAME_SIZE) == 0, msg);
+        }
+    }
+
+    /* 8.2 线序折进 == 老的两步路径（packFrame(false) + wirePrepareFrame(true)） */
+    for (int kind = 0; kind < 6; ++kind) {
+        for (int inv = 0; inv < 2; ++inv) {
+            buildTestPicture(fb, kind);
+            vfd::packFrame(fb, inv != 0, newOut, true); /* 折进：打包时直接产出线序 */
+            vfd::wirePrepareFrame(newOut, false);       /* 只做相位 −1 */
+            vfd::packFrame(fb, inv != 0, twoStep, false);
+            vfd::wirePrepareFrame(twoStep, true);       /* 老路径：反序 + 相位 −1 */
+            char msg[112];
+            snprintf(msg, sizeof(msg), "%s%s：线序折进 == 两步老路径（含相位 −1）",
+                picName[kind], inv ? " + invert" : "");
+            check(memcmp(newOut, twoStep, vfd::FRAME_SIZE) == 0, msg);
+        }
+    }
+
+    /* 8.3 边界与语义 */
+    {
+        /* T43（scan 0）只写两个槽：a→相对位 0、b→相对位 2，且不得越出 48 bit 组 */
+        static uint8_t t43fb[vfd::FRAMEBUFFER_SIZE];
+        memset(t43fb, 0, sizeof(t43fb));
+        for (int p = 0; p < vfd::PAGES; ++p) {
+            t43fb[p * vfd::WIDTH + 126] = 0xFF; /* dx=0 → off 2（kShift −2 后相对位 0） */
+            t43fb[p * vfd::WIDTH + 127] = 0xFF; /* dx=1 → off 4（相对位 2） */
+        }
+        static uint8_t t43Out[vfd::SCAN_BYTES];
+        vfd::packScan(t43fb, 0, false, t43Out);
+        int okT43 = 1;
+        for (int p = 0; p < vfd::PAGES; ++p) {
+            for (int m = 0; m < 8; ++m) {
+                const int lo = 6 * p + 6 * m; /* 相对位 0 与 2 都置 1 */
+                if (((t43Out[lo >> 3] >> (lo & 7)) & 1u) == 0)
+                    okT43 = 0;
+                const int hi = lo + 2;
+                if (((t43Out[hi >> 3] >> (hi & 7)) & 1u) == 0)
+                    okT43 = 0;
+            }
+        }
+        check(okT43, "T43 只用 a,b：8 页 × 8 行都在组内相对位 {0,2} 置位");
+
+        int usedBits = 0;
+        for (int i = 0; i < vfd::SCAN_BYTES; ++i)
+            usedBits += popcountBytes(&t43Out[i], 1);
+        check(usedBits == 2 * 8 * 8, "T43 只写两个槽 ⇒ 一扫描恰好 128 位（无填充位被误置）");
+
+        /* 扫描号越界（防御分支）：必须输出全 0，不得越界写 */
+        static uint8_t zeroOut[vfd::SCAN_BYTES];
+        memset(zeroOut, 0xAA, sizeof(zeroOut));
+        vfd::packScan(t43fb, -1, false, zeroOut);
+        const bool negOk = (popcountBytes(zeroOut, vfd::SCAN_BYTES) == 0);
+        vfd::packScan(t43fb, vfd::SCANS_PER_FRAME, false, zeroOut);
+        const bool bigOk = (popcountBytes(zeroOut, vfd::SCAN_BYTES) == 0);
+        check(negOk && bigOk, "扫描号越界（−1 / 43）⇒ 输出全 0（防御分支）");
+
+        /* invert 不污染填充位：全黑取反后，非可寻址链位必须仍为 0 */
+        static uint8_t blankFb[vfd::FRAMEBUFFER_SIZE];
+        vfd::packFrame(blankFb, true, newOut, false);
+        int strayInv = 0;
+        for (int s = 0; s < vfd::SCANS_PER_FRAME; ++s)
+            for (int by = 0; by < vfd::SCAN_BYTES; ++by)
+                strayInv += popcountBytes(&newOut[s * vfd::SCAN_BYTES + by], 1);
+        check(strayInv == 8192, "全黑 + invert ⇒ 恰好 8192 个可寻址位被置 1（填充位未被污染）");
+    }
+
+    /* 8.4 查表与 SWAR 反序的自身一致性 */
+    {
+        check(vfd::SPREAD.lo[0x01] == 0x00000001u && vfd::SPREAD.lo[0x11] == 0x00000001u
+                && vfd::SPREAD.hi[0x11] == 0x00000001u && vfd::SPREAD.hi[0x80] == 0x00040000u,
+            "查表语义：bit m → 位 6m（lo 段 m≤3 / hi 段 m≥4）");
+
+        check(vfd::reverseBitsPerByte32(0x01020304u) == 0x8040C020u,
+            "SWAR 逐字节反序（4 字节）：0x01020304 → 0x8040C020");
+
+        /* 逐字节反序的两条实现必须一致（32 位版 vs 8 位版） */
+        int swarOk = 1;
+        for (int v = 0; v < 256; ++v) {
+            const uint32_t packed = static_cast<uint32_t>(v) | (static_cast<uint32_t>(v ^ 0xFF) << 8)
+                | (static_cast<uint32_t>(v) << 16) | (static_cast<uint32_t>(v ^ 0xFF) << 24);
+            const uint32_t rev = vfd::reverseBitsPerByte32(packed);
+            if (static_cast<uint8_t>(rev) != vfd::reverseBits8(static_cast<uint8_t>(v))
+                || static_cast<uint8_t>(rev >> 8) != vfd::reverseBits8(static_cast<uint8_t>(v ^ 0xFF))
+                || static_cast<uint8_t>(rev >> 16) != vfd::reverseBits8(static_cast<uint8_t>(v))
+                || static_cast<uint8_t>(rev >> 24) != vfd::reverseBits8(static_cast<uint8_t>(v ^ 0xFF)))
+                swarOk = 0;
+        }
+        check(swarOk, "SWAR 反序与 reverseBits8 逐字节等价（256×4 组合）");
+    }
+}
+
+
 /* ------------------------------------------------------------------- main */
 
 int main()
@@ -507,6 +702,7 @@ int main()
     test_publish_protocol();
     test_scan_health();
     test_demo_screens();
+    test_pack_gather();
 
     printf("\n----------------------------------------\n");
     printf("检查项: %d, 失败: %d\n", g_checks, g_failures);
