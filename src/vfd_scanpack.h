@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+#include "vfd_hw_spec.h" /* SCAN_PERIOD_US / BLANK_GUARD_US / SCANS_PER_FRAME / SCAN_BYTES / FRAME_SIZE */
+
 /* ==================================================================== vfd_scanpack
  * 把 Adafruit_SSD1306 风格的页式帧缓冲重排成 GP1211AI 的"每时序 384 bit"数据流。
  *
@@ -25,10 +27,11 @@ namespace vfd {
 constexpr int WIDTH = 128;              /* 屏宽（像素列） */
 constexpr int HEIGHT = 64;              /* 屏高（像素行） */
 constexpr int PAGES = HEIGHT / 8;       /* 页式帧缓冲：8 页 */
-constexpr int SCANS_PER_FRAME = 43;     /* 一帧 43 个时序 */
-constexpr int SCAN_BYTES = 48;          /* 每个时序 384 bit = 48 字节 */
 constexpr int FRAMEBUFFER_SIZE = WIDTH * PAGES;                   /* 1024 B */
-constexpr int FRAME_SIZE = SCANS_PER_FRAME * SCAN_BYTES;          /* 2064 B */
+
+/* ⚠️ SCANS_PER_FRAME / SCAN_BYTES / FRAME_SIZE 的**定义**已集中到 src/vfd_hw_spec.h
+ *    （第三方工程评审 §4.3：原先这三处各有一份手抄副本，只靠注释维系一致）。
+ *    本文件只做"帧结构自检"与布局推导，不再重复定义。 */
 
 /* 帧缓冲访问：fb[y>>3][x] 的 bit(y&7)，与 Adafruit_SSD1306 布局一致 */
 inline bool pixelGet(const uint8_t *fb, int x, int y)
@@ -45,7 +48,7 @@ inline bool pixelGet(const uint8_t *fb, int x, int y)
  * （实测 tick 路径每帧省 ~43k 指令 ≈ 0.35 ms，见 docs/00 §4.2 的实测表）。 */
 void packScan(const uint8_t *fb, int scan, bool invert, uint8_t *out, bool wireOrder = false);
 
-/* 帧结构自检：下面几处按"扫描数 × 每扫描字节数"推地址，前提必须成立 */
+/* 帧结构自检：下面几处按"扫描数 × 每扫描字节数"推地址，前提必须成立（常量本体见 vfd_hw_spec.h） */
 static_assert(FRAME_SIZE == SCANS_PER_FRAME * SCAN_BYTES,
     "FRAME_SIZE 必须等于 SCANS_PER_FRAME × SCAN_BYTES");
 static_assert(SCAN_BYTES * 8 == 384, "一条扫描对应 384 位栅极链，改了要同步改移位链宽度");

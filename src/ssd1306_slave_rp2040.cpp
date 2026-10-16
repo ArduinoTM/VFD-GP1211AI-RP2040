@@ -295,6 +295,9 @@ bool Ssd1306SpiSlave::begin()
     _overruns = 0;
     _resetAsserted = false;
     _pendingResetEvent = false;
+    _resetEvents = 0; /* 与其它计数一致：begin() 视为一次全新开始
+                       * ⚠️ 只在 begin() 清零，**不在** resetStream() 清：后者是失步看护的恢复路径，
+                       *    清掉会把"主机拉过几次 RESET"这条排故信息抹掉。 */
     _stallResyncs = 0;
     _stallForced = 0;
     _stallAbort = false;
@@ -428,7 +431,8 @@ void __not_in_flash_func(Ssd1306SpiSlave::task)()
         if (remaining < DMA_COUNT_TOPUP) {
             _base = ringWrittenFromBase(_base, DMA_COUNT_FULL, remaining);
             dma_channel_set_trans_count(static_cast<uint>(_cfg.dma_ch), DMA_COUNT_FULL, false);
-            _overruns += 0; /* （补计数不丢数据；这里留空避免误读为丢包） */
+            /* 这条"补计数"路径**不**累加 `_overruns`：补计数本身不丢数据，
+             * 计进去会被误读成丢包（旧代码写的是 `_overruns += 0;`，已删）。 */
         }
     }
 }

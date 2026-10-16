@@ -10,8 +10,9 @@
  *   4. fillScreen(INVERSE) 语义与 fillRect(..., INVERSE) 一致（整体取反）；
  *   5. 禁止 setRotation()（旋转会让 _width/_height 与帧缓冲步长不一致，
  *      原版会越界写坏 _sendBuffer）；
- *   6. 扫描看护：task() 检测扫描心跳停摆，自动 recover()，连续失败则 emergencyOff()
- *      （手册明确"栅极扫描停止可能永久损坏 VFD"）。
+ *   6. 扫描看护：task() 检测扫描心跳停摆，自动 recover()，连续失败则 emergencyOff() **停泊**
+ *      （2026-10-16 起停泊 = 关高压 + 关断灯丝驱动 + BK 全消隐 + 停扫描，理由见 docs/07）；
+ *   7. 板载状态 LED：正常工作时闪烁（心跳），fatal 停泊后常亮。
  */
 #ifndef VFD_GP1211AI_H
 #define VFD_GP1211AI_H
@@ -39,6 +40,8 @@ public:
     static constexpr uint32_t MAX_RECOVER_ATTEMPTS = 3;
     /* display() 等待帧边界的超时（ms） */
     static constexpr uint32_t FRAME_SYNC_TIMEOUT_MS = 40;
+    /* 板载状态 LED 的心跳半周期（ms）：每半周期翻转一次 ⇒ 1 Hz 闪烁 */
+    static constexpr uint32_t STATUS_LED_BLINK_MS = 500;
 
     explicit VFD_GP1211AI(vfd::Platform &platform);
 
@@ -119,6 +122,8 @@ private:
     uint32_t _faults;
     uint32_t _recoverAttempts;
     bool _fatal;
+    uint32_t _ledLastToggleMs; /* 心跳：上次翻转 LED 的时刻 */
+    bool _ledOn;               /* 心跳：LED 当前状态 */
     bool _powerUpDone;        /* 上电时序是否已完成（beginAsync/pumpPowerUp 配对使用） */
 };
 

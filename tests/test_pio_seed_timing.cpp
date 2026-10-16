@@ -6,7 +6,9 @@
  *   播种的 1,1,0,0,0 从未进入 ⇒ 图案无法自复位。
  *   根因不在 PIO 程序，而在 CPU 侧的"请求脚窗口"完全错过了 PIO 的检查时刻：
  *     · PIO 每个扫描周期只在固定一点检查请求脚：扫描周期起点（PWM wrap / BK 上升沿）之后
- *       PIO_SEED_CHECK_CYCLES 个 SM 周期处（数据阶段 + 扫描边界脉冲之后）≈ 86.9 µs；
+ *       PIO_SEED_CHECK_CYCLES 个 SM 周期处（= 两个 wait 之后）≈ 0.22 µs；
+ *       ⚠️ 该 jmp pin 检查点已随「播种搬回 CPU」（2026-10-11）删除，此处只描述历史机制；
+ *       「≈86.9 µs（数据阶段 + 边界之后）」是**边界在数据段之后**的旧结构，勿再引用。
  *     · 整帧 DMA 完成中断发生在**本帧最后一次扫描的数据阶段内**（距该扫描的检查点仅几十 µs，
  *       因为 DMA 只需把最后一个字塞进 4 深 FIFO）。旧代码在这里拉高请求脚、忙等 20 µs 后拉低
  *       ⇒ 窗口结束了、检查点还没到 ⇒ 一帧都播不了种。
@@ -38,7 +40,7 @@ namespace model {
 using namespace vfd;
 
 constexpr double SM_HZ = static_cast<double>(PIO_SEED_SM_HZ_NOMINAL); /* 9.0014 MHz */
-constexpr double SCAN_US = 189.0;                                     /* 扫描周期 */
+constexpr double SCAN_US = static_cast<double>(PIO_SEED_SCAN_PERIOD_US); /* 扫描周期（源自 vfd_hw_spec.h） */
 constexpr int SCANS = static_cast<int>(PIO_SEED_SCANS_PER_FRAME);     /* 43 */
 constexpr double WORD_US = (32.0 * 2.0) * 1e6 / SM_HZ;                /* 一个字 = 32bit × 2 周期 */
 constexpr double CHECK_US = PIO_SEED_CHECK_CYCLES * 1e6 / SM_HZ;      /* 检查点在扫描起点之后 */

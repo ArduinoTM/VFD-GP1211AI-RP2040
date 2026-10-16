@@ -50,6 +50,11 @@ public:
     /* 紧急关断：先关高压再停扫描（保护屏），用于扫描故障无法恢复时。 */
     virtual void emergencyOff() = 0;
 
+    /* 板载状态 LED（可选）：**默认空实现** —— 平台没有 LED 时调用无任何副作用。
+     * 约定（2026-10-16 产品需求）：正常工作时由驱动按 VFD_GP1211AI::STATUS_LED_BLINK_MS
+     * 翻转（心跳闪烁 ⇒ 主循环还活着）；进入 fatal 停泊后由驱动置 true **常亮**。 */
+    virtual void setStatusLed(bool on) { (void)on; }
+
     /* 亮度 0..255（0 = 全暗）。实现方式为"点亮窗口宽度"控制，
      * 不违反手册 Note 7②"数据传输期间不得改变 BK"。 */
     virtual void setBrightness(uint8_t brightness) = 0;

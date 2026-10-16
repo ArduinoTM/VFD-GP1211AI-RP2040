@@ -31,7 +31,7 @@ STM32F103 Arduino 驱动）**移植到 RP2040 / Raspberry Pi Pico（Pico SDK）*
 * 完全符合手册关键条款：fCLK ≤ 5 MHz、CLK 空闲高（Note 7①）、
   传输期间 BK 不变（Note 7②③④）、桁间消隐 ≥5 µs（Note 16）
 * 自带**扫描心跳看护**：手册 Note 14 明确"栅极扫描停止可能永久损坏屏"，
-  停摆会自动恢复，连续失败则**先关高压再停扫描**
+  停摆会自动恢复，连续失败则**停泊**（先关高压 + 关断灯丝驱动 + BK 全消隐 + 停扫描，板载 LED 常亮）
 * **SSD1306 行为模拟**：对端 MCU 用现成 SSD1306 库（Adafruit_SSD1306 / u8g2…）
   经 4 线 SPI 直接把画面发过来即可；支持显示/反显/全亮/对比度（→亮度）、页/水平/垂直寻址、
   **滚动（`0x26/0x27/0x29/0x2A` + `0x2E/0x2F`）**；**内置测试图像默认不渲染**，只有把
@@ -71,7 +71,7 @@ STM32F103 Arduino 驱动）**移植到 RP2040 / Raspberry Pi Pico（Pico SDK）*
 │  └─ compat/                  # Arduino 兼容层（让 Adafruit_GFX 在裸 Pico SDK 上编译）
 ├─ lib/Adafruit_GFX/           # vendor 的 Adafruit GFX v1.2.3（BSD，仅必需 4 文件）
 ├─ tests/                      # 宿主机测试（g++，无需嵌入式工具链）
-│  ├─ run_host_tests.ps1       # 一键跑：6 个测试程序（321 项 + 核间握手 79102 项）+ SDK 语法桩 + 6 个 .ino 语法
+│  ├─ run_host_tests.ps1       # 一键跑：6 个测试程序（325 项 + 核间握手 79102 项）+ SDK 语法桩 + 6 个 .ino 语法
 │  ├─ reference_pack.*         # 原驱动 display() 的 1:1 转录（位重排对照用）
 │  ├─ host_syntax/stub/        # Pico SDK 形状桩（让目标机源码能在 PC 上做 -fsyntax-only）
 │  ├─ host_syntax/stub_arduino/ # Arduino/Adafruit/u8g2 形状桩（给 examples/ 的 .ino 做语法检查）
@@ -86,7 +86,7 @@ STM32F103 Arduino 驱动）**移植到 RP2040 / Raspberry Pi Pico（Pico SDK）*
 ### 1) 宿主机测试（1 分钟，不需要任何嵌入式工具链）
 
 ```powershell
-powershell -File tests\run_host_tests.ps1      # 需要 g++/clang++（6 个程序：75+122+28+53+43 = 321 项，另加核间握手回归 79102 项）
+powershell -File tests\run_host_tests.ps1      # 需要 g++/clang++（6 个程序：79+122+28+53+43 = 325 项，另加核间握手回归 79102 项）
 ```
 
 跑的是**目标机同一份驱动源码**（`src/`），用一个模拟扫描引擎的 `MockPlatform`：
@@ -233,6 +233,9 @@ PIO 引擎额外要求 `LAT/CLKg/SIg` 三者**引脚连续**（默认 GP4/5/6）
 | 用途 | CLKA | SIA | LAT | CLKG | SIG | BK | HVEN | FLEN | —（保留） | 主机 SCK | 主机 MOSI | 主机 DC | 主机 CS | 主机 RESET | 测试模式¹ |
 
 ¹ 上电为低 → 渲染内置测试图像；高/悬空 → 只做 SSD1306 从机（默认）。
+
+（另：**GP25 = 板载状态 LED**，不接驱动板 —— 正常工作时闪烁（心跳）、fatal 停泊后常亮；
+`-DVFD_PIN_LED=n` 可改，`255` = 关闭。Pico W 等没有该宏的板子自动不驱动。）
 （GP10 早期用作 PIO 的"帧末播种请求"握手脚，现播种由 CPU 在帧末直接翻引脚，该脚已不再使用。）
 
 > ⚠️ 驱动板有 **45 V（VDD2）** 与 **2.9 Vac 灯丝**；`FLEN` 高电平是**关断**灯丝驱动。
@@ -273,7 +276,7 @@ for (;;) {
 | 桁间消隐 | 无显式实现（Note 16） | ≈100 µs（≫ 5 µs） |
 | 帧缓冲/撕裂 | `display()` 与 ISR 共用一块发送缓冲 | **双缓冲 + 帧边界握手**，任意调用节奏不撕裂 |
 | 灯丝预热 | 100 ms | 400 ms（可配） |
-| 扫描保护 | 无 | 心跳看护 → 自动恢复 → 连续失败**关高压** |
+| 扫描保护 | 无 | 心跳看护 → 自动恢复 → 连续失败**停泊**（关高压 + 关灯丝驱动 + LED 常亮） |
 | 颜色 ≥3 | 静默丢弃（默认文字色画不出字） | 归一化为 WHITE |
 | `invertDisplay()` | 无效（基类空实现） | 生效（重排阶段按像素取反） |
 | `fillScreen(INVERSE)` | 变成白色 | 整体取反（与 `fillRect(INVERSE)` 一致） |
@@ -379,7 +382,7 @@ oled.display();      // 调一次即可，本机持续显示
 
 | 工作流 | 触发 | 做什么 |
 |---|---|---|
-| [`ci.yml`](.github/workflows/ci.yml) | push 到 `main` / PR / 手动 | 跑宿主机测试（321 项 + 核间握手 79102 项 + SDK 语法桩 + 6 个 `.ino` 语法），并编译 **4 种固件组合**（tick / pio × 单核 / 双核），uf2 作为构建产物上传 |
+| [`ci.yml`](.github/workflows/ci.yml) | push 到 `main` / PR / 手动 | 跑宿主机测试（325 项 + 核间握手 79102 项 + SDK 语法桩 + 6 个 `.ino` 语法），并编译 **4 种固件组合**（tick / pio × 单核 / 双核），uf2 作为构建产物上传 |
 | [`release.yml`](.github/workflows/release.yml) | 推 `v*` 标签 / 手动 | 先跑测试，再编译同样 4 种组合，然后自动创建 GitHub Release 并把 4 个 uf2 附上（`-tick` / `-pio` / `-tick-dual` / `-pio-dual`，发布说明自动生成）|
 
 发版只需打标签：

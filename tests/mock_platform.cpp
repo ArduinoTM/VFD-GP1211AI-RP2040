@@ -31,10 +31,18 @@ void MockPlatform::powerUp(uint32_t preheat_ms)
 
 void MockPlatform::emergencyOff()
 {
+    /* 与 Rp2040Platform 的新语义一致（2026-10-16）：**关高压**、关断灯丝驱动、停扫描；
+     * 状态 LED 由驱动层（VFD_GP1211AI::task()）置常亮。 */
     _emergencyOffs++;
     _hvOn = false;
+    _filamentOn = false;
     _litWindowUs = 0;
     _engineStopped = true;
+}
+
+void MockPlatform::setStatusLed(bool on)
+{
+    _statusLed = on;
 }
 
 void MockPlatform::setBrightness(uint8_t brightness)

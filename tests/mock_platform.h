@@ -25,6 +25,7 @@ public:
     void init() override;
     void powerUp(uint32_t preheat_ms) override;
     void emergencyOff() override;
+    void setStatusLed(bool on) override;
     void setBrightness(uint8_t brightness) override;
     void publishFrame(const uint8_t *frame) override;
     uint32_t frameStartCount() const override { return _frameStarts; }
@@ -53,6 +54,7 @@ public:
     uint32_t serviceCalls() const { return _serviceCalls; }
     bool hvOn() const { return _hvOn; }
     bool filamentOn() const { return _filamentOn; }
+    bool statusLedOn() const { return _statusLed; }
     uint32_t preheatSeenMs() const { return _preheatSeenMs; }
     int currentScan() const { return _scan; }
 
@@ -83,6 +85,7 @@ private:
     uint32_t _serviceCalls = 0;
     bool _hvOn = false;
     bool _filamentOn = false;
+    bool _statusLed = false;
     uint32_t _preheatSeenMs = 0;
 };
 

@@ -17,9 +17,10 @@
  *     检查点 = 扫描周期起点 + PIO_SEED_CHECK_CYCLES / (2 × CLKa)
  *            = wrap + 2 / (2 × 4.5007 MHz) ≈ wrap + 0.22 µs   （两个 wait 之后立刻检查）
  *
- * ⚠️ 别把「检查点」与「扫描边界脉冲」混为一谈：边界四步（CLKg 前进 + LAT 锁存）在**同一扫描的
- *    数据阶段之后**才发生，落在 wrap + 802 周期 ≈ +89.1 µs 处。wiring.md §4 里那条
- *    「≈86.9 µs / 782 周期」说的是**边界脉冲的位置**，不是检查点。
+ * ⚠️ 别把「检查点」与「扫描边界脉冲」混为一谈：**现程序（`src/vfd_scan.pio`）的两个 wait 之后
+ *    立即**是边界四步 ⇒ 边界脉冲落在扫描起点之后 ≈0.2–2 µs（2026-10-16 LA 实测：② CLKg↑ 前进沿
+ *    在 +0.58…0.70 µs）。`PIO_SCAN_WORK_CYCLES` = 802 是**整扫描周期预算**（含数据段），
+ *    不是边界位置；旧文档里的「≈86.9 µs / 782 周期」是「边界在数据段之后」的早期结构，勿再引用。
  *
  * 而整帧 DMA 完成中断（CPU 唯一的每帧事件）发生在**本帧最后一次扫描的数据阶段内**，
  * 距该扫描的检查点只有几十 µs（取决于 TX FIFO 深度）⇒ 若在这里直接把请求脚拉高、
@@ -46,6 +47,8 @@
 #define VFD_PIO_SEED_TIMING_H
 
 #include <stdint.h>
+
+#include "vfd_hw_spec.h" /* 帧结构 / 扫描周期 / 消隐下限的唯一来源 */
 
 namespace vfd {
 
@@ -79,11 +82,20 @@ constexpr uint32_t PIO_SEED_HOLD_US = 100;   /* 保持 100 µs：跨过 +0.22 µ
 /* 检查点在扫描起点之后的**标称**时间（µs @ CLKa 4.5007 MHz），仅用于文档/日志 */
 constexpr uint32_t PIO_SEED_CHECK_US_NOMINAL = 0; /* 检查点就在扫描起点（+0.22 µs） */
 
-/* 时基与帧结构（供时序模型使用；与 vfd_scanpack.h / Rp2040Config 保持一致） */
-constexpr uint32_t PIO_SEED_SM_HZ_NOMINAL = 9001400; /* 2 × 4.5007 MHz */
-constexpr uint32_t PIO_SEED_SCANS_PER_FRAME = 43;
-constexpr uint32_t PIO_SEED_WORDS_PER_SCAN = 12;  /* 48 字节/扫描（DMA 直接喂发布帧） */
-constexpr uint32_t PIO_SEED_FRAME_WORDS = 516;    /* 43 × 12 */
+/* 时基与帧结构（供时序模型使用）—— **全部从 src/vfd_hw_spec.h 派生**，不再各留一份副本
+ * （第三方工程评审 §4.3：此前这里与 vfd_scanpack.h / Rp2040Config 是三次手抄） */
+constexpr uint32_t PIO_SEED_SM_HZ_NOMINAL = 9001400; /* 2 × 4.5007 MHz（clkdiv 定点化后的实际 CLKa） */
+constexpr uint32_t PIO_SEED_SCAN_PERIOD_US = static_cast<uint32_t>(SCAN_PERIOD_US);
+constexpr uint32_t PIO_SEED_SCANS_PER_FRAME = static_cast<uint32_t>(SCANS_PER_FRAME);
+constexpr uint32_t PIO_SEED_WORDS_PER_SCAN = static_cast<uint32_t>(SCAN_BYTES / 4); /* 48 B = 12 个字 */
+constexpr uint32_t PIO_SEED_FRAME_WORDS = PIO_SEED_SCANS_PER_FRAME * PIO_SEED_WORDS_PER_SCAN; /* 516 */
+
+/* 互锁：任何一处改了数值，这里立刻编译失败（而不是等到实机画面出错） */
+static_assert(SCAN_BYTES % 4 == 0, "整扫描字节数必须能按 32bit 字搬运");
+static_assert(PIO_SEED_WORDS_PER_SCAN * 4u == static_cast<uint32_t>(SCAN_BYTES),
+    "每扫描字数 × 4 必须等于 SCAN_BYTES（DMA 按字搬运的前提）");
+static_assert(PIO_SEED_FRAME_WORDS * 4u == static_cast<uint32_t>(FRAME_SIZE),
+    "帧字数 × 4 必须等于 FRAME_SIZE");
 /* TX FIFO 深度：扫描引擎没有 join FIFO ⇒ TX 4 深（OSR 另可容纳 1 个字） */
 constexpr uint32_t PIO_SEED_FIFO_DEPTH = 4;
 constexpr uint32_t PIO_SEED_OSR_DEPTH = 1;

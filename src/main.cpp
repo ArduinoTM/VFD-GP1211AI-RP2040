@@ -171,8 +171,13 @@ static uint32_t gBigGapCount = 0;              /* 本窗口 >4 ms 的间隔个�
 
 /* 排空一条主机链路的"实例"版本：CS 边沿 / 事务边界 / 复位事件 + 环形缓冲 → 模拟器。
  * ⚠️ **双核构建下什么都不做**：core1 是环形缓冲的唯一消费者，core0 碰它的游标/计数
- *    就会撕裂数据通路（所以这里的 `#if` 是**语义**，不是优化）。 */
-static void serviceLink(vfd::Ssd1306SpiSlave &slave, vfd::Ssd1306Emulator &emu)
+ *    就会撕裂数据通路（所以这里的 `#if` 是**语义**，不是优化）。
+ * `[[maybe_unused]]` 的理由：**双核 + `-Diag off`** 时函数体为空、且没有任何调用者
+ *    （唯一的调用点在 `printChunked()` 里，而它只在 `-Diag on` 时编译）
+ *    ⇒ 不加这句会报 `-Wunused-function`（双核配置此前一直带着这条告警，见 docs/07 纪律 23）。
+ *    保留"存在但空转"而不是整体排除，是为了让 `serviceHostLink()` / `printChunked()`
+ *    的调用形式在两种引擎下保持一致。 */
+[[maybe_unused]] static void serviceLink(vfd::Ssd1306SpiSlave &slave, vfd::Ssd1306Emulator &emu)
 {
 #if !VFD_DUAL_CORE
     { /* 间隔统计：起点是上一次的"排空结束"时刻（gLastDrainUs 在函数末尾更新）。
@@ -391,7 +396,7 @@ static void runTestImageLoop(VFD_GP1211AI &display, vfd::Rp2040Platform &platfor
         /* 主循环看护：清 FIFO + 扫描心跳检查（停摆会自动恢复，连续失败则紧急关断） */
         if (!display.task() && display.isFatal() && !fatalReported) {
             fatalReported = true;
-            printf("!! scan engine fatal: faults=%lu, HV disabled\n",
+            printf("!! scan engine fatal: faults=%lu, parked: HV off, filament off, LED steady on\n",
                 static_cast<unsigned long>(display.faultCount()));
         }
         reportScanHealthOnce(platform); /* 心跳在涨但引擎报停摆 ⇒ 缺帧，生产构建也可见 */
@@ -493,7 +498,10 @@ static void runSsd1306EmulatorLoop(VFD_GP1211AI &display, vfd::Rp2040Platform &p
      *   · SCLK 无跳变           ⇒ 没有时钟进来（SCK/MOSI 接反也会这样）。
      * 只读引脚，不改方向/功能（PIO 的输入采样不受影响）。 */
 #if VFD_DEBUG_DIAG
-    const uint8_t monPins[4] = { 11, 12, 13, 14 };   /* SCLK / MOSI / DC / CS */
+    /* ⚠️ 必须跟随 slaveCfg（可用 -DVFD_EMU_PIN_* 覆盖）：写死 11/12/13/14 的话，
+     * 用户一旦改引脚，PINMON 会去监控**错误的引脚**，并给出"无跳变(疑未接通)"这类
+     * 错误结论 —— 而排故恰恰靠这几行判词。 */
+    const uint8_t monPins[4] = { slaveCfg.pin_sck, slaveCfg.pin_mosi, slaveCfg.pin_dc, slaveCfg.pin_cs };
     uint32_t pcHist[16] = { 0 };                     /* PC 直方图（判定状态机是否真卡死） */
     uint32_t pushIrqCount = 0;                       /* push 次数（PIO IRQ0 轮询计数） */
     uint8_t monLast[4] = { 0xFF, 0xFF, 0xFF, 0xFF };
@@ -513,7 +521,7 @@ static void runSsd1306EmulatorLoop(VFD_GP1211AI &display, vfd::Rp2040Platform &p
             fatalReported = true;
             /* 同 reportScanHealthOnce：运行期告警走 bootPrintf（分块 + 块间排水），
              * 不用 printf（stdout=UART+USB，USB 不取数据时会长时间阻塞 ⇒ 无排水窗口）。 */
-            bootPrintf("!! scan engine fatal: faults=%lu, HV disabled\n",
+            bootPrintf("!! scan engine fatal: faults=%lu, parked: HV off, filament off, LED steady on\n",
                 static_cast<unsigned long>(display.faultCount()));
         }
         reportScanHealthOnce(platform); /* 心跳在涨但引擎报停摆 ⇒ 缺帧，生产构建也可见 */
@@ -993,7 +1001,7 @@ static void runSsd1306EmulatorLoopDualCore(VFD_GP1211AI &display, vfd::Rp2040Pla
     for (;;) {
         if (!display.task() && display.isFatal() && !fatalReported) {
             fatalReported = true;
-            printf("!! scan engine fatal: faults=%lu, HV disabled\n",
+            printf("!! scan engine fatal: faults=%lu, parked: HV off, filament off, LED steady on\n",
                 static_cast<unsigned long>(display.faultCount()));
         }
 

@@ -37,8 +37,9 @@ Rp2040Config defaultRp2040Config()
     cfg.pin_bk = VFD_PIN_BK;
     cfg.pin_hv_en = VFD_PIN_HV_EN;
     cfg.pin_fl_en = VFD_PIN_FL_EN;
-    cfg.scan_period_us = 189; /* 43 × 189 us = 8.12 ms -> 123.1 Hz（手册要求 >= 120 Hz） */
-    cfg.blank_guard_us = 100;
+    /* 硬件常量集中在 src/vfd_hw_spec.h（唯一来源；第三方工程评审 §4.3） */
+    cfg.scan_period_us = static_cast<uint32_t>(SCAN_PERIOD_US); /* 43 × 189 us = 8.127 ms -> 123.0 Hz（手册 >= 120 Hz） */
+    cfg.blank_guard_us = static_cast<uint32_t>(BLANK_GUARD_US);
     cfg.preheat_ms = DEFAULT_PREHEAT_MS;
 
 #if VFD_SCAN_ENGINE_PIO
@@ -134,6 +135,13 @@ void Rp2040Platform::init()
     gpio_put(_cfg.pin_hv_en, 0); /* HVEN 低 = 关高压 */
     gpio_put(_cfg.pin_fl_en, 1); /* LM9022 ST 高 = 灯丝驱动关断 */
 
+#if VFD_PIN_LED != 255
+    /* 板载状态 LED（编译期常量，见 vfd_platform_rp2040.h）：上电先灭，正常运行时由驱动心跳翻转 */
+    gpio_init(VFD_PIN_LED);
+    gpio_set_dir(VFD_PIN_LED, GPIO_OUT);
+    gpio_put(VFD_PIN_LED, 0);
+#endif
+
     /* ---- 2. BK 的 PWM：一个 PWM 周期 = 一个扫描周期，先全消隐 ---- */
     _pwmSlice = static_cast<int>(pwm_gpio_to_slice_num(_cfg.pin_bk));
     _pwmChannel = pwm_gpio_to_channel(_cfg.pin_bk);
@@ -209,6 +217,18 @@ void Rp2040Platform::publishFrame(const uint8_t *frame)
     memcpy(_frameCopy[next], frame, vfd::FRAME_SIZE);
     _copyLatest = next;
     _published = _frameCopy[next];
+}
+
+/* 板载状态 LED（见 VFD_PIN_LED；编译期常量，不进 Rp2040Config）。
+ * 调用频率：心跳 1 Hz 翻转 + fatal 每次 task() 置位 ⇒ 都是一条 IO 写；
+ * 该板没有 GPIO LED（255）时整体编译成空操作。 */
+void Rp2040Platform::setStatusLed(bool on)
+{
+#if VFD_PIN_LED == 255
+    (void)on;
+#else
+    gpio_put(VFD_PIN_LED, on ? 1 : 0);
+#endif
 }
 
 void Rp2040Platform::setBrightness(uint8_t brightness)
@@ -287,9 +307,15 @@ bool Rp2040Platform::powerUpPoll()
 
 void Rp2040Platform::emergencyOff()
 {
-    /* 手册 Note 14：栅极扫描停止可能永久损坏屏。
-     * 所以先关高压，再停扫描；同时把 BK 固定为全消隐。 */
+    /* fatal 停泊（2026-10-16 加固，理由见 docs/07 本阶段记录）：
+     *   · **HVEN = 0**：先关高压 —— 手册 Note 14 的毁屏工况就是"**高压 + 扫描停**"，
+     *     停泊必须先断高压（这条口径不变）；
+     *   · **FLEN = 1**：再关断 LM9022 灯丝驱动（本轮新增）⇒ 灯丝停止发射并降温、降低功耗；
+     *   · BK 固定全消隐（applyPwmLevel(…, 0)，level = wrap+1 ⇒ 恒高、无点亮窗口）；
+     *   · 停扫描；LED 由驱动层（VFD_GP1211AI::task()）置常亮。
+     * 顺序与手册一致：**先关高压，再停扫描**。 */
     gpio_put(_cfg.pin_hv_en, 0);
+    gpio_put(_cfg.pin_fl_en, 1);
     applyPwmLevel(_pwmSlice, _pwmChannel, _pwmWrap, 0);
     _litWindowUs = 0;
     sleep_ms(10);

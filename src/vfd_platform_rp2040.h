@@ -15,7 +15,8 @@
  * │   PIO 一个状态机同时产生 CLKa / SIa / CLKg / LAT / SIg：
  * │     · 阳极数据由 DMA 连续灌入 TX FIFO（DREQ 节流，PIO 自己数 48 字节/扫描）
  * │     · 扫描周期由 BK(PWM) 的消隐边沿同步 —— 数据传输天然落在消隐窗口内
- * │     · 帧末的栅极链播种(1,1,0,0,0) 也由 PIO 完成
+ * │     · 帧末的栅极链播种(1,1,0,0,0) 由 CPU 在帧完成中断里直接翻引脚（seedGrid()，2026-10-11 起；
+ * │       原先在 PIO 程序里，为腾出 32 条指令而搬走 —— 见 docs/08 §7 的 P6）
  * │   CPU 只在一帧结束时进一次中断（123 Hz）：换帧缓冲 + 重启 DMA
  * │   ⇒ 扫描时序不再依赖中断延迟；即使主循环/中断被拖慢，扫描仍按时序进行
  * └
@@ -24,15 +25,17 @@
  * 时序（一个扫描周期 = 189 us，PWM 一个周期也是 189 us）：
  *
  *   0 us        PWM wrap → BK 变高（消隐开始）
- *               PIO/中断 在这里开始把 48 字节送入阳极移位链
- *   ~87/92 us   数据移完 → CLKg 前进一位（选通下两条栅极）+ LAT 锁存
- *               （全程 BK 恒定消隐：满足手册 Note 7②③④，桁间消隐 ≫ Note 16 的 5 us）
- *   100 us      BK 取消消隐 → 本次扫描的 3 列 × 64 行点亮
+ *   +0.2–1.5 us 边界四步：CLKg↓ → CLKg↑（栅极前进一位）→ LAT↑（锁存）→ LAT↓（释放）
+ *               （pio：两个 wait 之后立即走四步；tick：中断入口直接翻引脚）
+ *   ~+1.5–90 us 数据段：把本扫描的 48 字节送入阳极移位链（全程 BK 恒定消隐 ⇒ Note 7②）
+ *   100 us      BK 取消消隐 → 本次扫描的 3 列 × 64 行点亮（全亮时；默认亮度 200 为 70 us）
  *   189 us      进入下一扫描
  *
  * “点亮窗口”= 189 - blank_guard_us（默认 89 us），亮度 = 窗口宽度 / 189，最大约 47%。
- * 若要更亮可以调小 blank_guard_us，但必须大于"数据搬运 + 锁存（+ 帧末播种）"的时间：
- * 引擎会在 init() 里自检，必要时自动抬高 guard 并通过 guardMarginUs() 暴露余量。
+ * 若要更亮可以调小 blank_guard_us，但必须大于"数据搬运 + 边界四步"的时间：
+ * 引擎会在 init() 里自检（`PIO_SCAN_WORK_CYCLES + PIO_SEED_CYCLES` 换算成时间），必要时自动抬高
+ * guard 并通过 guardMarginUs() 暴露余量。⚠️ 帧末播种由 CPU 完成、**不占 PIO 周期**，但它同样必须
+ * 落在消隐窗口内 —— 当前实现下播种尾巴会跨过点亮起点（手册 Note 7③ 每帧 2 次），见 docs/08 §7 的 P6。
  */
 #ifndef VFD_PLATFORM_RP2040_H
 #define VFD_PLATFORM_RP2040_H
@@ -94,6 +97,26 @@
 #ifndef VFD_PIN_TEST_MODE /* 测试模式选择：上电时该脚为低 → 渲染内置测试图像 */
 #define VFD_PIN_TEST_MODE 16
 #endif
+
+/* 板载状态 LED（2026-10-16 需求）：正常工作时闪烁（心跳）、fatal 停泊后常亮。
+ * 默认取 SDK 的板卡宏（Pico / Pico 2 = GP25）；**没有该宏的板子**（如 Pico W：LED 挂在 CYW43 上）
+ * 自动退化为"不驱动"。可用 -DVFD_PIN_LED=n 覆盖，或用 255 显式关闭。 */
+#ifndef VFD_PIN_LED
+#if defined(PICO_DEFAULT_LED_PIN)
+#define VFD_PIN_LED PICO_DEFAULT_LED_PIN
+#else
+#define VFD_PIN_LED 255 /* 该板没有 GPIO 板载 LED ⇒ setStatusLed() 空操作 */
+#endif
+#endif
+
+/* LED 脚不得与已用引脚冲突（这类冲突原本只能上机才发现）。
+ * 注：SSD1306 从机的 VFD_EMU_PIN_*（11–15）在另一个头文件里，不在此断言范围内。 */
+static_assert(VFD_PIN_LED == 255
+        || (VFD_PIN_LED != VFD_PIN_CLKA && VFD_PIN_LED != VFD_PIN_SIA && VFD_PIN_LED != VFD_PIN_LAT
+            && VFD_PIN_LED != VFD_PIN_CLKG && VFD_PIN_LED != VFD_PIN_SIG && VFD_PIN_LED != VFD_PIN_BK
+            && VFD_PIN_LED != VFD_PIN_HV_EN && VFD_PIN_LED != VFD_PIN_FL_EN
+            && VFD_PIN_LED != VFD_PIN_TEST_MODE),
+    "VFD_PIN_LED 与扫描/控制引脚冲突：换一个脚号，或设 255 关闭 LED 指示");
 
 /* ---- tick 引擎资源 ---- */
 #ifndef VFD_DMA_TX_CH
@@ -166,6 +189,10 @@ struct Rp2040Config {
     uint32_t preheat_ms;     /* 灯丝预热时间 */
 };
 
+/* ⚠️ 状态 LED 的脚号**不进 Rp2040Config**：它是编译期常量（VFD_PIN_LED，默认取板卡宏）。
+ *    塞进结构体会让整个 Rp2040Platform 对象布局后移，引擎/打包这些"不该动"的函数
+ *    指令编码也跟着变 ⇒ 就没法用"扫描关键函数逐指令相同"来证明改动没碰时序（S1，见 docs/07）。 */
+
 Rp2040Config defaultRp2040Config();
 
 /* 每个扫描周期内引擎需要完成的工作量、以及 PIO 播种请求的时序窗口，
@@ -189,6 +216,8 @@ public:
     void powerUpBegin(uint32_t preheat_ms) override;
     bool powerUpPoll() override;
     void emergencyOff() override;
+    /* 板载状态 LED（见 VFD_PIN_LED）：驱动层只在心跳翻转与 fatal 停泊时调用 */
+    void setStatusLed(bool on) override;
     void setBrightness(uint8_t brightness) override;
     void publishFrame(const uint8_t *frame) override;
     bool wireReversesByteBits() const override;

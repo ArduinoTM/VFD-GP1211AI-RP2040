@@ -8,7 +8,8 @@
  *   3. 反显只在真实像素位上取反；
  *   4. 绘图原语 / 颜色归一化 / setRotation 保护 / fillScreen(INVERSE)；
  *   5. display() 双缓冲协议不撕裂（含"应用比引擎快"的连续调用场景）；
- *   6. 扫描停摆看护：自动 recover，连续失败 emergencyOff；
+ *   6. 扫描停摆看护：自动 recover，连续失败 emergencyOff（停泊：关高压 + 关灯丝）；
+ *      板载状态 LED：正常工作时心跳闪烁、fatal 后常亮；
  *   7. 示例画面渲染（打印 ASCII 预览）。
  */
 #include <stdio.h>
@@ -435,7 +436,22 @@ static void test_scan_health()
     check(display.task(), "恢复后回到正常");
     check(display.faultCount() == 1, "故障计数保留");
 
-    /* recover 一直失败 -> 紧急关断高压并进入 fatal（保护屏） */
+    /* 板载状态 LED：正常工作时闪烁（心跳）、fatal 停泊后常亮（2026-10-16 需求） */
+    {
+        MockPlatform p3;
+        VFD_GP1211AI d3(p3);
+        d3.begin(0);
+        d3.task();
+        check(!p3.statusLedOn(), "LED 心跳：起始为灭");
+        p3.advanceUs(VFD_GP1211AI::STATUS_LED_BLINK_MS * 1000u + 1u);
+        d3.task();
+        check(p3.statusLedOn(), "LED 心跳：半个周期后点亮");
+        p3.advanceUs(VFD_GP1211AI::STATUS_LED_BLINK_MS * 1000u);
+        d3.task();
+        check(!p3.statusLedOn(), "LED 心跳：一个周期后熄灭");
+    }
+
+    /* recover 一直失败 -> 紧急停泊（关高压 + 关断灯丝驱动）并进入 fatal（保护屏，见 docs/07） */
     plat.setEngineStopped(true);
     plat.setRecoverFails(true);
     for (int i = 0; i < 8 && !display.isFatal(); ++i) {
@@ -444,7 +460,8 @@ static void test_scan_health()
     }
     check(display.isFatal(), "连续恢复失败进入 fatal");
     check(plat.emergencyOffCount() == 1, "fatal 前调用 emergencyOff()");
-    check(!plat.hvOn(), "紧急关断后高压已断开");
+    check(!plat.hvOn() && !plat.filamentOn(), "fatal 停泊：高压已关断 + 灯丝驱动关断");
+    check(plat.statusLedOn(), "fatal 后 LED 常亮");
 
     /* 上电时序：灯丝先于高压，且预热时间被真正等到 */
     MockPlatform p2;

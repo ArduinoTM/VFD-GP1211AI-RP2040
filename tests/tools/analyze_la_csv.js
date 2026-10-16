@@ -30,6 +30,7 @@
 'use strict';
 
 const fs = require('fs');
+const zlib = require('zlib');
 const readline = require('readline');
 
 const SIGNALS = ['CLKa', 'SIa', 'LAT', 'CLKg', 'SIg', 'BK', 'HVEN', 'FLEN'];
@@ -81,7 +82,13 @@ function sigHighSegments(sigEdges) {
 }
 
 async function analyze(file, windowOpt) {
-    const rl = readline.createInterface({ input: fs.createReadStream(file), crlfDelay: Infinity });
+    /* 支持 '.csv' 与 '.csv.gz'（黄金样本入库时压缩，见 tests/captures/README.md） */
+function openCsv(file) {
+    const s = fs.createReadStream(file);
+    return /\.gz$/i.test(file) ? s.pipe(zlib.createGunzip()) : s;
+}
+
+const rl = readline.createInterface({ input: openCsv(file), crlfDelay: Infinity });
 
     let col = null;
     let prev = null; /* {t, v: {sig: 0/1}} */
@@ -238,11 +245,13 @@ async function analyze(file, windowOpt) {
                 }
             }
             /* Note 7①：一个扫描周期里"阳极数据段结束之后、点亮窗口之前"的区间内 CLKa 应为高。
-             * 数据段从 BK 上升沿（= 扫描起点）开始，约 85.3 µs（384 bit @4.5 MHz）；
-             * 边界脉冲在 +86.9 µs。取 (88 µs, 118 µs) 这个结构化的空闲区间来判定。 */
+             * 现结构（pio）= 两个 wait 之后**立即**走边界四步（≈0.2–1.5 µs），随后才是数据段
+             * （384 bit @4.5 MHz ≈ 85.3 µs）⇒ 数据段约在 +1.5…+88 µs；
+             * 取 (91 µs, 118 µs) 这段空闲区间判定（默认亮度 200 时点亮从 +119 µs 开始）。
+             * ⚠️ tick 引擎数据段 ≈+88 µs 结束，同一窗口对 tick 偏保守。 */
             if (lastBkRiseT !== null) {
                 const dt = (t - lastBkRiseT) * 1e6;
-                if (dt > 88 && dt < 118 && !gapBefore) {
+                if (dt > 91 && dt < 118 && !gapBefore) {
                     clkaIdle.total++;
                     if (v.CLKa === 1) clkaIdle.high++;
                 }
@@ -410,13 +419,16 @@ function compliance(r) {
         ['tLS（最后 CLK 沿 → LAT）', '≥ 250 ns',
             '最后一次 SIa 跳变 → LAT 低沿：最小 ' + us(minSinceSia)
                 + '；最后一个 CLKa 上升沿 → LAT 低沿：最小 ' + us(minSinceClka),
-            judge('tLS', num(minSinceSia) && minSinceSia * 1e9 >= 250,
-                '按"数据在 LAT 有效前已稳定"理解：满足（≥ 250 ns）',
-                num(minSinceSia) ? `按"数据在 LAT 有效前已稳定"理解：实测 ${us(minSinceSia)} < 250 ns`
-                                 : '不可测（无 LAT 低沿样本）')
-                + (num(minSinceClka) && minSinceClka * 1e9 < 250
-                    ? '；⚠️ 若手册的 tLS 定义为"最后一个 CLKa 沿 → LAT"，则实测偏小，可考虑在边界脉冲前加一拍延时'
-                    : '')],
+            judge('tLS',
+                num(minSinceClka) && minSinceClka * 1e9 >= 250
+                    && (!num(minSinceSia) || minSinceSia * 1e9 >= 250),
+                num(minSinceSia)
+                    ? `满足（CLKa 版 ${us(minSinceClka)}、SIa 版 ${us(minSinceSia)} 都 ≥ 250 ns）`
+                    : `满足（本抓包无 SIa 跳变，按手册定义用 CLKa 版 ${us(minSinceClka)} ≥ 250 ns）`,
+                !num(minSinceClka) ? '不可测（无 LAT 低沿样本）'
+                    : (num(minSinceSia) && minSinceSia * 1e9 < 250
+                        ? `按"数据在 LAT 有效前已稳定"理解：实测 ${us(minSinceSia)} < 250 ns`
+                        : `按手册定义（最后一个 CLKa 上升沿 → LAT 有效沿）：实测 ${us(minSinceClka)} < 250 ns`))],
         ['tLH（LAT 高）', '≥ 120 ns',
             num(tLhNs) ? ns(tLhNs / 1e9) + '（≈扫描周期 189.05 µs − LAT 低）' : 'n/a',
             judge('tLH', num(tLhNs) && tLhNs >= 120,

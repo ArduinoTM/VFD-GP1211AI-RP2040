@@ -29,6 +29,8 @@ VFD_GP1211AI::VFD_GP1211AI(vfd::Platform &platform)
     , _faults(0)
     , _recoverAttempts(0)
     , _fatal(false)
+    , _ledLastToggleMs(0)
+    , _ledOn(false)
     , _powerUpDone(true) /* 未调用 begin/beginAsync 时视为"无需推进" */
 {
     memset(_framebuffer, 0, sizeof(_framebuffer));
@@ -45,6 +47,11 @@ void VFD_GP1211AI::beginAsync(uint32_t preheat_ms)
 
     _platform.init();
     _platform.setBrightness(_brightness);
+
+    /* 状态 LED：上电先灭；正常运行时由 task() 心跳翻转，fatal 停泊后常亮 */
+    _ledOn = false;
+    _ledLastToggleMs = _platform.millis();
+    _platform.setStatusLed(false);
 
     /* 先发布一帧合法（空白）数据，避免扫描引擎启动瞬间读到未初始化缓冲。
      * 线序（tick 的 SPI 只能 MSB-first）在打包时就直接产出（wireOrder），
@@ -74,6 +81,10 @@ bool VFD_GP1211AI::pumpPowerUp()
     _lastScanMillis = _platform.millis();
     _recoverAttempts = 0;
     _fatal = false;
+    /* 重新上电（含 fatal 后的重启）后 LED 从"灭 + 心跳"重新开始 */
+    _ledOn = false;
+    _ledLastToggleMs = _platform.millis();
+    _platform.setStatusLed(false);
     _powerUpDone = true;
     return true;
 }
@@ -272,8 +283,18 @@ bool VFD_GP1211AI::task()
 {
     _platform.service();
 
-    if (_fatal)
+    if (_fatal) {
+        _platform.setStatusLed(true); /* 停泊：LED 常亮（本地可见的故障指示，见 docs/07） */
         return false;
+    }
+
+    /* 状态 LED 心跳：正常工作时闪烁（用平台毫秒时基，与主循环节拍无关） */
+    const uint32_t nowMs = _platform.millis();
+    if (static_cast<uint32_t>(nowMs - _ledLastToggleMs) >= STATUS_LED_BLINK_MS) {
+        _ledLastToggleMs = nowMs;
+        _ledOn = !_ledOn;
+        _platform.setStatusLed(_ledOn);
+    }
 
     const uint32_t scans = _platform.scanCount();
     if (scans != _lastScanCount) {
@@ -293,6 +314,7 @@ bool VFD_GP1211AI::task()
     if (++_recoverAttempts > MAX_RECOVER_ATTEMPTS) {
         _platform.emergencyOff();
         _fatal = true;
+        _platform.setStatusLed(true); /* 立即常亮，不等下一次 task() */
         return false;
     }
 

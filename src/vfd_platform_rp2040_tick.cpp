@@ -80,11 +80,17 @@ void Rp2040Platform::engineInit()
     gpio_put(_cfg.pin_clkg, 1); /* 空闲高 */
     gpio_put(_cfg.pin_sig, 0);
 
-    /* ---- 2. SPI：MODE3(CPOL=1 空闲高，满足 Note 7①) + LSB-first ---- */
+    /* ---- 2. SPI：MODE3(CPOL=1 空闲高，满足 Note 7①) ----
+     * ⚠️ 这里**必须**传 SPI_MSB_FIRST：PL022 只支持 MSB-first；传 SPI_LSB_FIRST 时该参数是
+     *    `__unused`（被忽略），SDK 里 `invalid_params_if(… order != SPI_MSB_FIRST)` 那行**在**，
+     *    只是 `PARAM_ASSERTIONS_ENABLED_HARDWARE_SPI` 默认为 0 才没炸 —— 一旦有人开启断言
+     *    （`PARAM_ASSERTIONS_ENABLE_ALL=1`）就会在 init() 直接 panic。
+     *    本驱动要的 LSB-first 是**逻辑位序**，由打包阶段逐字节反序产出
+     *    （`packFrame(..., wireOrder=true)`，见 vfd_scanpack.h 的"传输层适配"）。 */
     gpio_set_function(_cfg.pin_clka, GPIO_FUNC_SPI);
     gpio_set_function(_cfg.pin_sia, GPIO_FUNC_SPI);
     spi_init(_cfg.spi, _cfg.spi_hz);
-    spi_set_format(_cfg.spi, 8, SPI_CPOL_1, SPI_CPHA_1, SPI_LSB_FIRST);
+    spi_set_format(_cfg.spi, 8, SPI_CPOL_1, SPI_CPHA_1, SPI_MSB_FIRST);
     _spiBaudrate = spi_set_baudrate(_cfg.spi, _cfg.spi_hz);
 
     /* ---- 3. DMA ---- */
