@@ -17,13 +17,9 @@
 
 namespace vfd {
 
-/* BK 是"高 = 消隐、低 = 点亮"：PWM 输出高的时间 = blank_guard_us，
- * 点亮窗口 = 周期剩余时间，宽度由亮度决定。 */
-static inline void applyPwmLevel(int slice, uint channel, uint32_t wrap, uint32_t litUs)
-{
-    pwm_set_chan_level(static_cast<uint>(slice), channel,
-        static_cast<uint16_t>(wrap + 1 - litUs));
-}
+/* BK 是"高 = 消隐、低 = 点亮"：PWM 输出高的时间 = 消隐窗口 = 扫描周期 − 点亮窗口，
+ * 点亮窗口的宽度**只由亮度决定**（vfd_pio_seed_timing.h 的映射，两个引擎共用）。
+ * 电平换算的唯一实现在头文件的 rp2040ApplyPwmLevel()（inline：tick 的扫描中断里也要用）。 */
 
 Rp2040Config defaultRp2040Config()
 {
@@ -146,7 +142,9 @@ void Rp2040Platform::init()
     _pwmSlice = static_cast<int>(pwm_gpio_to_slice_num(_cfg.pin_bk));
     _pwmChannel = pwm_gpio_to_channel(_cfg.pin_bk);
     _pwmWrap = _cfg.scan_period_us - 1;
-    _maxLitUs = _cfg.scan_period_us - _cfg.blank_guard_us;
+    /* 峰值点亮窗口：两个引擎都取产品档 80%（= 151 µs，亮度映射的另一端；见 vfd_pio_seed_timing.h）。
+     * ⚠️ 选项 C 起 `_cfg.blank_guard_us` **两个引擎都不再用**：消隐窗口 = 扫描周期 − 点亮窗口。 */
+    _maxLitUs = PIO_LIT_MAX_US;
     if (_maxLitUs == 0)
         _maxLitUs = 1;
 
@@ -156,7 +154,7 @@ void Rp2040Platform::init()
     pwm_config_set_clkdiv(&pc, static_cast<float>(clock_get_hz(clk_sys)) / 1000000.0f);
     pwm_config_set_wrap(&pc, static_cast<uint16_t>(_pwmWrap));
     pwm_init(static_cast<uint>(_pwmSlice), &pc, false);
-    applyPwmLevel(_pwmSlice, _pwmChannel, _pwmWrap, 0);
+    rp2040ApplyPwmLevel(_pwmSlice, _pwmChannel, _pwmWrap, 0);
     pwm_set_enabled(static_cast<uint>(_pwmSlice), true);
 
     /* ---- 3. 状态复位 ---- */
@@ -169,12 +167,12 @@ void Rp2040Platform::init()
     _dmaBusyErrors = 0;
     _engineError = false;
 
-    /* ---- 4. 引擎（可能抬高 blank_guard_us，因此再刷新一次消隐电平）---- */
+    /* ---- 4. 引擎初始化（把消隐电平打到"全消隐"，等 setBrightness 来开窗口）---- */
     engineInit();
-    _maxLitUs = _cfg.scan_period_us - _cfg.blank_guard_us;
+    _maxLitUs = PIO_LIT_MAX_US;
     if (_maxLitUs == 0)
         _maxLitUs = 1;
-    applyPwmLevel(_pwmSlice, _pwmChannel, _pwmWrap, 0);
+    rp2040ApplyPwmLevel(_pwmSlice, _pwmChannel, _pwmWrap, 0);
 
     /* ---- 5. 启动扫描 ---- */
     engineStart();
@@ -233,16 +231,21 @@ void Rp2040Platform::setStatusLed(bool on)
 
 void Rp2040Platform::setBrightness(uint8_t brightness)
 {
-    _litWindowUs = (brightness == 0)
-        ? 0
-        : 1u + (static_cast<uint32_t>(brightness) * (_maxLitUs - 1)) / 255u;
+    /* 选项 C（2026-10-17，**两个引擎同一套**）：点亮窗口 = **20%–80%**（38–151 µs），
+     * 两段线性 + 跳过 4 µs 死区，整数映射、无浮点、无 gamma（映射本体在
+     * vfd_pio_seed_timing.h，宿主机测试逐点验证）。
+     * 低亮度段走"搬运落在消隐窗口内"的落点，高亮度段（≥ 102 µs）走手册 Figure 5 的落点。 */
+    _litWindowUs = pioLitWindowUs(brightness);
+    /* 落点必须跟着亮度走：否则切换后的那一帧里"新亮度 + 旧落点"会让搬运跨过 BK 边沿
+     * （Note 7②）。两个引擎各自实现 applyBrightnessMode()：
+     *   · pio：等状态机停到 wait 上，把搬运闸门在 `wait 0 pin BK` / `nop` 之间打补丁；
+     *   · tick：把新亮度挂起，等下一个扫描边界与 PWM 电平**一起**生效（在途搬运不会被打断）。
+     * ⚠️ tick 的 PWM 电平不在这里写：中断里的搬运可能正在飞，此刻改电平会让 BK 边沿
+     *    落进搬运内部（Note 7②）—— 见 vfd_platform_rp2040_tick.cpp 的 applyBrightnessMode()。 */
 #if VFD_SCAN_ENGINE_PIO
-    /* PIO 引擎靠 BK 的上升/下降沿来对齐扫描周期，因此即使亮度为 0
-     * 也保留 1 us 的点亮窗口（占空 0.5%，视觉上等同全黑）。 */
-    if (_litWindowUs == 0)
-        _litWindowUs = 1;
+    rp2040ApplyPwmLevel(_pwmSlice, _pwmChannel, _pwmWrap, _litWindowUs);
 #endif
-    applyPwmLevel(_pwmSlice, _pwmChannel, _pwmWrap, _litWindowUs);
+    applyBrightnessMode();
 }
 
 /* 上电时序的固定等待（ms）；预热时长由调用方给定（默认 400，见 DEFAULT_PREHEAT_MS） */
@@ -316,7 +319,7 @@ void Rp2040Platform::emergencyOff()
      * 顺序与手册一致：**先关高压，再停扫描**。 */
     gpio_put(_cfg.pin_hv_en, 0);
     gpio_put(_cfg.pin_fl_en, 1);
-    applyPwmLevel(_pwmSlice, _pwmChannel, _pwmWrap, 0);
+    rp2040ApplyPwmLevel(_pwmSlice, _pwmChannel, _pwmWrap, 0);
     _litWindowUs = 0;
     sleep_ms(10);
     engineStop();

@@ -1,18 +1,30 @@
 /*
  * vfd_platform_rp2040_tick.cpp —— 默认扫描引擎："定时器 + SPI + DMA"。
  *
- * 每个扫描周期（189 µs）由 repeating_timer 中断驱动：
- *   ① BK 消隐（PWM 计数器归零，锁定点亮窗口相位）
- *   ② CLKg 前进一位 + LAT 锁存（此时 BK 为消隐）
- *   ③ 帧边界：切换帧缓冲、把 1,1,0,0,0 播种进栅极链
- *   ④ 启动 DMA：48 字节 帧缓冲 -> SPI0 TX FIFO（TX DREQ 节流），CPU 不搬数据
- * 阳极数据在 SPI 移位期间（约 86 µs）完成，全部落在消隐窗口内。
+ * 每个扫描周期（189 µs）由 repeating_timer 中断驱动，**选项 C（2026-10-17）之后与 pio
+ * 引擎逐条同形**（亮度映射与落点边界共用 src/vfd_pio_seed_timing.h，别抄第二份）：
+ *   ① BK 消隐（PWM 计数器归零 = 消隐起点，锁定点亮窗口相位在周期尾部）
+ *   ② CLKg 前进一位 + LAT 锁存（边界四步，此时 BK 为消隐）
+ *   ③ 帧边界：切换帧缓冲（在整帧第一次扫描，先于边界四步）
+ *   ④ 搬运落点两选一（按亮度）：
+ *        · 低亮度（点亮 ≤ 97 µs）：立即触发 DMA ⇒ 48 字节整段落在**消隐**窗口内；
+ *        · 高亮度（点亮 ≥ 102 µs）：消隐窗口装不下 87 µs 的搬运 ⇒ 排一个**一次性闹钟**，
+ *          等 BK 变低（点亮起点）再触发 ⇒ 整段落在**点亮**窗口内（手册 Figure 5 形态）。
+ *          ⚠️ 不用中断里忙等：高亮度档的等待是 38…87 µs/扫描（20%–45% CPU）。
+ *   ⑤ 整帧最后一次扫描：紧跟边界之后把 1,1,0,0,0 播种进栅极链（消隐窗口内；低亮度时与
+ *      搬运并行 —— CLKg/SIg 与 CLKa/SIa 是两套互不相干的移位链，LAT 全程低 ⇒ 不可见）。
+ *      播种位置与"帧首边界之前"逐位等价（两者之间没有别的 CLKg 上升沿）⇒ 画面相位不变。
+ * 阳极数据由 DMA 搬到 SPI0 TX FIFO（TX DREQ 节流），CPU 不搬数据；SPI 4.464 MHz 下
+ * 384 bit ≈ 86 µs。落点是否满足手册 Note 7②（搬运期间 BK 不得变化）由头文件的
+ * static_assert 在**编译期**保证：低亮度 边界+搬运 ≤ 消隐窗口；高亮度 搬运+延迟+收尾 ≤ 点亮窗口。
  */
 #include "vfd_platform_rp2040.h"
 
 #include "hardware/gpio.h"
 #include "hardware/pwm.h"
 #include "hardware/spi.h"
+#include "hardware/sync.h"  /* save_and_disable_interrupts（挂起亮度变更时保护那一对值）*/
+#include "hardware/timer.h" /* timer_hw：等 BK 变高的超时判据（1 MHz 计时器）*/
 #include "pico/time.h"
 
 namespace vfd {
@@ -65,6 +77,34 @@ static inline void __not_in_flash_func(vfdSigHoldDelay)()
         tight_loop_contents();
 }
 
+/* 等 BK **真的在引脚上**变高。
+ *
+ * ⚠️ 2026-10-17 tick 四档抓包揪出的坑：pwm_set_counter(slice, 0) 只是把 PWM 的计数寄存器写 0，
+ *    而 PWM 的输出比较跟着**它自己的计数时钟**走（本项目 clkdiv 让 PWM 计数 1 µs 一拍）
+ *    ⇒ 写寄存器到引脚翻转有 ≈0.3–1 µs 的滞后；而 gpio_put(CLKg, …) 走 SIO、几乎立刻到引脚。
+ *    于是"先写 CTR、再翻 CLKg"在**引脚上**变成"CLKg 先变低、BK 后变高"—— 实测每扫描 1 次
+ *    Note 7③（4 份抓包各 2115/2116 次，CLKg↓ 比 BK↑ 早 0.18–0.30 µs）。
+ *    手册 Note 7③ 要求"CLK 为低时不得改变 BK"⇒ 必须**先看到 BK 变高**再动 CLKg。
+ *    超时 3 µs：正常 0.3–0.7 µs 就返回；真超时（引脚/输入通路坏了）也不在这里停摆
+ *    —— 扫描不能停（手册 Note 14），照旧往下走，让抓包去暴露问题。 */
+static inline void __not_in_flash_func(vfdWaitBkHigh)(uint8_t pin)
+{
+    const uint32_t t0 = timer_hw->timerawl;
+    while (!gpio_get(pin) && static_cast<uint32_t>(timer_hw->timerawl - t0) < 3u) {
+    }
+}
+
+/* BK↑ 与随后的 CLKg↓ 之间再拉开一点：物理上让 BK 先稳下来，同时保证任何采样率下这两个沿
+ * 都能被分开看见。与 vfdSigHoldDelay() 同一套忙等，只是目的不同（那个是 SIg 的保持时间）。
+ * ⚠️ 实测（2026-10-17 四档抓包）：24 次循环 ≈2.2 µs（含轮询尾巴）—— 比原先注释里估的 0.4 µs
+ *    长得多，已按实测写进 TICK_BOUNDARY_US 与 TICK_LIT_LOW_MAX_US（见 vfd_pio_seed_timing.h）。
+ *    不再加长：它已经是低亮度落点余量（0x80 档实测 4.6 µs）的主要开销。 */
+static inline void __not_in_flash_func(vfdBkSettleDelay)()
+{
+    for (volatile int i = 0; i < 24; ++i)
+        tight_loop_contents();
+}
+
 /* ------------------------------------------------------------------ 引擎实现 */
 
 void Rp2040Platform::engineInit()
@@ -79,6 +119,10 @@ void Rp2040Platform::engineInit()
     gpio_put(_cfg.pin_lat, 0); /* LAT 空闲低（高有效，正脉冲锁存） */
     gpio_put(_cfg.pin_clkg, 1); /* 空闲高 */
     gpio_put(_cfg.pin_sig, 0);
+    /* BK 是 PWM 输出，但扫描中断要**读回**它的引脚电平（等 BK↑ 再动 CLKg，见 vfdWaitBkHigh()）
+     * ⇒ 打开该 pad 的输入缓冲。SDK 的 gpio_set_function() 默认就把 IE 置 1，这里显式再来一次，
+     * 与 pio 引擎的做法一致（那边读 BK 当 wait 条件）。 */
+    gpio_set_input_enabled(_cfg.pin_bk, true);
 
     /* ---- 2. SPI：MODE3(CPOL=1 空闲高，满足 Note 7①) ----
      * ⚠️ 这里**必须**传 SPI_MSB_FIRST：PL022 只支持 MSB-first；传 SPI_LSB_FIRST 时该参数是
@@ -96,24 +140,43 @@ void Rp2040Platform::engineInit()
     /* ---- 3. DMA ---- */
     configureDma();
 
-    /* ---- 4. 消隐裕量自检：48 字节的移位时间 + 中断内 GPIO/触发开销 ---- */
-    const uint32_t transferUs = (48u * 8u * 1000000u) / (_spiBaudrate ? _spiBaudrate : 1u) + 4u;
-    if (_cfg.blank_guard_us <= transferUs) {
-        _cfg.blank_guard_us = transferUs + 4u; /* 自动抬高，避免违反 Note 7② */
-        _guardMarginUs = 4u;
-    } else {
-        _guardMarginUs = _cfg.blank_guard_us - transferUs;
-    }
+    /* ---- 4. 落点自洽性：**在编译期**由 vfd_pio_seed_timing.h 的 static_assert 保证
+     *（低亮度：边界 + 搬运 ≤ 消隐窗口；高亮度：搬运 + 触发延迟 + 收尾 ≤ 点亮窗口），
+     * 这里只算一个供诊断口播的"余量"，形态与 pio 引擎的 guardMarginUs() 一致。
+     * ⚠️ 只算数、**不新增 _engineError 条件**：任何新判错都会让 engineStart() 直接 return、
+     *    状态机/定时器不启动而表现为"只有 BK 跳变"（2026-10-16 已踩两次）。 */
+    /* 让"落点判据"与"PWM 电平"从第一刻起就一致：recover() 可能在"亮度变更还挂起"时重入，
+     * 这里把挂起项一并落地（宁可丢一次 189 µs 的延后，也不要出现"落点按新亮度、PWM 按旧亮度"的错配）。*/
+    _pendingApply = false;
+    _appliedLitUs = _litWindowUs; /* 引擎当前生效的点亮窗口（落点判据与 PWM 电平都以它为准）*/
+    rp2040ApplyPwmLevel(_pwmSlice, _pwmChannel, _pwmWrap, _appliedLitUs);
+    const uint32_t litUs = _litWindowUs ? _litWindowUs : static_cast<uint32_t>(PIO_LIT_MIN_US);
+    _guardMarginUs = tickLowBrightnessPlacement(litUs)
+        ? ((PIO_SEED_SCAN_PERIOD_US - litUs > TICK_BOUNDARY_US + TICK_XFER_US)
+              ? (PIO_SEED_SCAN_PERIOD_US - litUs) - (TICK_BOUNDARY_US + TICK_XFER_US) : 0u)
+        : (litUs > TICK_XFER_US + TICK_TRIG_DELAY_US
+              ? litUs - (TICK_XFER_US + TICK_TRIG_DELAY_US) : 0u);
 }
 
 void Rp2040Platform::engineStart()
 {
+    /* 先给栅极链播一次种（engineStart 时扫描还没跑起来，这里不占用任何窗口）：
+     * 播种已挪到"整帧最后一次扫描"（见 seedGrid()），不先播的话第一帧要跑满 8.1 ms
+     * 才能让栅极图案成形。pio 引擎的 engineStart() 同样先播一次。 */
+    seedGrid();
     startScanTimer();
 }
 
 void Rp2040Platform::engineStop()
 {
     stopScanTimer();
+    /* 点亮起点的一次性闹钟不能留到停扫之后（它会去触发一次搬运 / 多播一次种）*/
+    if (_trigAlarm >= 0) {
+        cancel_alarm(_trigAlarm);
+        _trigAlarm = -1;
+    }
+    _alarmDoesXfer = false;
+    _seedPending = false;
     dma_channel_abort(static_cast<uint>(_cfg.dma_tx));
     dma_channel_abort(static_cast<uint>(_cfg.dma_rx));
 }
@@ -212,39 +275,91 @@ bool __not_in_flash_func(Rp2040Platform::scanTimerThunk)(repeating_timer_t *t)
     return static_cast<Rp2040Platform *>(t->user_data)->scanTick();
 }
 
+/* 触发本扫描的 48 字节搬运。两条调用路径：
+ *   · 低亮度落点：scanTick() 在边界四步之后**直接**调用（消隐窗口内，紧跟边界）；
+ *   · 高亮度落点：triggerThunk() 在"BK 变低（点亮起点）"之后由一次性闹钟调用。 */
+void __not_in_flash_func(Rp2040Platform::triggerScanTransfer)()
+{
+    const volatile uint8_t *src = _pendingSrc;
+    if (src == nullptr)
+        return;
+    if (dma_channel_is_busy(static_cast<uint>(_cfg.dma_tx))) {
+        _dmaBusyErrors++; /* 理论上不会发生：周期远大于传输时间 */
+        return;
+    }
+    dma_channel_transfer_from_buffer_now(static_cast<uint>(_cfg.dma_tx), src, SCAN_BYTES);
+}
+
+/* "点亮起点"一次性闹钟的回调（每个扫描周期最多一个，两种用途）：
+ *   · 高亮度落点：触发本扫描的 48 字节搬运（等 BK 变低之后再搬 ⇒ 整段落在点亮窗口内）；
+ *   · 帧末扫描：紧跟其后做栅极链播种（两种落点都用同一条闹钟）。
+ * 为什么用闹钟而不是在扫描中断里忙等：等待 = 消隐窗口 − 边界 ≈ 38…87 µs，每个扫描都忙等
+ * 会吃掉 20%–45% CPU（见 docs/17 §6 选项 A 的代价评估）。闹钟的容差很宽：搬运只要落进
+ * [点亮起点, 扫描周期 − 搬运 − 收尾]（lit = 102 µs 档最紧 ≈13 µs）；播种只要整段在点亮
+ * 窗口内（lit 最小 38 µs，播种 ≈21 µs ⇒ 余量 ≈17 µs）。 */
+int64_t __not_in_flash_func(Rp2040Platform::triggerThunk)(alarm_id_t id, void *user_data)
+{
+    (void)id;
+    Rp2040Platform *self = static_cast<Rp2040Platform *>(user_data);
+    self->_trigAlarm = -1;
+    if (self->_alarmDoesXfer)
+        self->triggerScanTransfer();
+    if (self->_seedPending) {
+        self->_seedPending = false;
+        self->seedGrid();
+    }
+    return 0; /* 一次性：不再排程 */
+}
+
+/* 亮度变了：把新点亮窗口挂起，等**下一个扫描边界**与 PWM 电平一起生效。
+ * 为什么不能立刻生效：中断里触发的 DMA 可能正在飞（搬运 ≈86 µs），此刻改 PWM 比较值会让
+ * BK 边沿落进搬运内部 ⇒ 违反 Note 7②（pio 版用"等状态机停到 wait 再打指令补丁"解决同一问题）。
+ * 延到扫描边界只晚 ≤189 µs（人工改亮度察觉不到），而边界处"在途搬运"必定已经结束
+ * （搬运末沿 ≤ 边界 + 91 µs < 189 µs）。
+ * ⚠️ 关中断写这一对值：中断可能在两句之间读走"新值 + 旧标志"（或反之）。 */
+void Rp2040Platform::applyBrightnessMode()
+{
+    const uint32_t save = save_and_disable_interrupts();
+    _pendingLitUs = _litWindowUs;
+    _pendingApply = true;
+    restore_interrupts(save);
+}
+
 bool __not_in_flash_func(Rp2040Platform::scanTick)()
 {
 #if VFD_DEBUG_DIAG
     const uint32_t irqT0 = time_us_32(); /* 诊断：ISR 忙时累计起点（VFD_DEBUG_DIAG） */
 #endif
-    /* (1) PWM 计数器归零：BK 立即回到消隐，锁定点亮窗口相位在扫描周期尾部 */
-    pwm_set_counter(static_cast<uint>(_pwmSlice), 0);
+    /* (0) 兜底清理 + 挂起的亮度变更在**扫描边界**生效：
+     *   · 上一次扫描排的高亮度落点闹钟正常早已消费；万一被极端延迟拖过 189 µs，
+     *     这里取消掉 —— 否则它会落到本扫描上，等于本扫描触发两次搬运。
+     *   · 亮度变更与 PWM 电平必须**同时**生效（见 applyBrightnessMode()）。*/
+    if (_trigAlarm >= 0) {
+        cancel_alarm(_trigAlarm);
+        _trigAlarm = -1;
+    }
+    _alarmDoesXfer = false;
+    _seedPending = false; /* 捞回来的闹钟不会执行，别把标志留给下一帧（否则会多播一次种）*/
+    if (_pendingApply) {
+        _pendingApply = false;
+        _appliedLitUs = _pendingLitUs;
+        rp2040ApplyPwmLevel(_pwmSlice, _pwmChannel, _pwmWrap, _appliedLitUs);
+    }
 
-    /* (2) 帧首：**先播种 5 个移位，再前进/锁存**。
-     *
-     * ⚠️ 顺序很关键（实物照片定位出来的 bug）：原驱动 `VFD_GP1211AI::timerHandler()`
-     *    在帧首是"先 5 个播种脉冲（SIg=1,1,0,0,0），再发前进脉冲"。
-     *    本移植原来写成"先前进一步、再播种 5 个"，当时以为"移位可交换"——**错了**：
-     *    一帧共 6 次帧首移位，送进链的**位序列**不同：
-     *      先播种：1,1,0,0,0,0  ⇒ 链里那对 1 落在位置 (47,48)
-     *      先前进：0,1,1,0,0,0  ⇒ 落在 (46,47)
-     *    差一个位置 = 每帧所有栅极对整体错开一格 = **画面水平错 3 列**
-     *    （左起 3 列永远不亮、其余内容整体右移 3 列——与实测照片完全一致）。
-     */
+    /* (1) PWM 计数器归零：BK 回到消隐（消隐起点 = 扫描周期起点），锁定点亮窗口相位在周期尾部。
+     *     ⚠️ 必须**等到 BK 真的在引脚上变高**、再与随后的 CLKg↓ 拉开 ≈0.4 µs，才能走边界四步：
+     *        PWM 的输出比较跟着它自己的计数时钟走，写 CTR 到引脚翻转有 ≈0.3–1 µs 滞后，而 SIO
+     *        写 CLKg 几乎立刻到引脚 —— 不等就会出现"CLKg 先低、BK 后高"= 每扫描 1 次 Note 7③
+     *        （2026-10-17 tick 四档抓包实测 2115/2116）。见 vfdWaitBkHigh() 的注释。 */
+    pwm_set_counter(static_cast<uint>(_pwmSlice), 0);
+    vfdWaitBkHigh(_cfg.pin_bk); /* 等引脚上的 BK↑（正常 ≈0.3–0.7 µs，超时 3 µs）*/
+    vfdBkSettleDelay();         /* 再让位 ≈0.4 µs，让两个沿在任何采样率下都分得开 */
+    const uint32_t periodT0 = time_us_32(); /* 本扫描周期起点（≈ 引脚上 BK 变高的时刻）*/
+
+    /* (2) 帧边界：切到最新发布的帧缓冲（先于边界四步；播种已挪到帧末，见 seedGrid()）*/
     if (_scan == 0) {
-        /* 帧边界：切到最新发布的帧缓冲 */
         _active = _published;
         _frameStarts++;
-
-        /* 栅极链播种：SIg 依次移入 1,1,0,0,0（5 个时钟，必须在前进脉冲之前） */
-        gpio_put(_cfg.pin_sig, 1);
-        vfdStrobe(_cfg.pin_clkg);
-        vfdStrobe(_cfg.pin_clkg);
-        vfdSigHoldDelay();
-        gpio_put(_cfg.pin_sig, 0);
-        vfdStrobe(_cfg.pin_clkg);
-        vfdStrobe(_cfg.pin_clkg);
-        vfdStrobe(_cfg.pin_clkg);
     }
 
     /* (3) 边界四步：**先前进、再锁存** —— 顺序必须与 PIO 引擎一致。
@@ -268,14 +383,55 @@ bool __not_in_flash_func(Rp2040Platform::scanTick)()
     rp2040ShortDelayUs(2);
     gpio_put(_cfg.pin_lat, 0);  /* ④ 释放，回到空闲 */
 
-    /* (4) 启动本次扫描的 48 字节搬运 */
+    /* (4) 搬运落点两选一 + 帧末播种的时机（选项 C，与 pio 引擎同一形态；判据与边界见
+     *     vfd_pio_seed_timing.h）：
+     *   · 低亮度（点亮 ≤ 95 µs）：搬运紧跟边界 ⇒ 整段落在**消隐**窗口内
+     *     （消隐窗口 = 189 − 点亮 ≥ 94 µs，装得下 边界 ~7 + 搬运 87）；
+     *   · 高亮度（点亮 ≥ 102 µs）：消隐窗口装不下 ⇒ 排一次性闹钟、等 BK 变低（点亮起点）
+     *     再触发 ⇒ 整段落在**点亮**窗口内（手册 Figure 5 形态）。
+     *   · 帧末播种（整帧最后一次扫描）：**也等点亮起点**再播（两种落点共用那条闹钟）——
+     *     位置在 A42 之后、A0 之前（= 帧首扫描的边界之前），整段落在同一个 BK 相位内。
+     *     ⚠️ 2026-10-17 四档抓包教训：原来"紧跟 A42 之后立刻播"会让播种组与 A42 的前进脉冲
+     *        并成一组（SIg 采样 0,1,1,0,0,0），而 pio 引擎（实机验证过）的形态是
+     *        "播种 5 个紧跟帧首那 1 个前进"（1,1,0,0,0,0）—— analyze_la_csv.js 的
+     *        "帧首 SIg 序列"正是按后者判的（当时 49 个组全报 0,1,1,0,0,0）。
+     * ⚠️ 两条路都**不在中断里忙等**：等待 38…87 µs/扫描 = 20%–45% CPU（docs/17 §6 选项 A）。 */
     const volatile uint8_t *src = _active;
-    if (src != nullptr) {
-        if (dma_channel_is_busy(static_cast<uint>(_cfg.dma_tx))) {
-            _dmaBusyErrors++; /* 理论上不会发生：周期远大于传输时间 */
-        } else {
-            dma_channel_transfer_from_buffer_now(static_cast<uint>(_cfg.dma_tx),
-                src + _scan * SCAN_BYTES, SCAN_BYTES);
+    _pendingSrc = (src != nullptr) ? (src + _scan * SCAN_BYTES) : nullptr;
+    const bool frameEnd = (_scan == SCANS_PER_FRAME - 1);
+    const bool lowPlacement = tickLowBrightnessPlacement(_appliedLitUs);
+    if (lowPlacement && _pendingSrc != nullptr)
+        triggerScanTransfer(); /* 低亮度：搬运紧跟边界（消隐窗口内）*/
+
+    /* 要排"点亮起点 + TICK_TRIG_DELAY_US"闹钟的两种情况：
+     *   · 高亮度档的搬运（等 BK 变低再搬）；· 帧末播种（两种落点都要，等点亮起点再播）。
+     * 两者共用同一个闹钟槽（一个扫描周期最多一个）。*/
+    const bool alarmForXfer = !lowPlacement && _pendingSrc != nullptr;
+    if (alarmForXfer || frameEnd) {
+        _alarmDoesXfer = alarmForXfer;
+        _seedPending = frameEnd;
+        /* 点亮起点（相对本扫描周期起点）= 扫描周期 − 点亮窗口；再留 TICK_TRIG_DELAY_US
+         * 避开边沿本身（保证搬运整段在点亮窗口内、播种不压在 BK 下降沿上）。
+         * 闹钟延时按"现在"折算（边界四步刚过去 ~5 µs）；万一已经过点，fire_if_past
+         * 让它立即触发（仍然落在点亮窗口内，只是余量变小）。*/
+        const uint32_t litStartUs =
+            static_cast<uint32_t>(PIO_SEED_SCAN_PERIOD_US) - _appliedLitUs;
+        const uint32_t targetUs = litStartUs + TICK_TRIG_DELAY_US;
+        const uint32_t elapsedUs = time_us_32() - periodT0;
+        const int64_t delayUs = static_cast<int64_t>(targetUs) - static_cast<int64_t>(elapsedUs);
+        _trigAlarm = add_alarm_in_us(delayUs > 0 ? static_cast<uint64_t>(delayUs) : 0u,
+            triggerThunk, this, true);
+        if (_trigAlarm < 0) {
+            /* 闹钟池满（理论上不会）：退化成忙等 —— 宁可吃这几微秒的 CPU，
+             * 也不能让搬运跨过 BK 下降沿（Note 7②）或让播种落错相位。*/
+            while (static_cast<int32_t>(time_us_32() - periodT0) < static_cast<int32_t>(targetUs)) {
+            }
+            if (_alarmDoesXfer)
+                triggerScanTransfer();
+            if (_seedPending) {
+                _seedPending = false;
+                seedGrid();
+            }
         }
     }
 
@@ -286,6 +442,38 @@ bool __not_in_flash_func(Rp2040Platform::scanTick)()
     _irqUs += time_us_32() - irqT0; /* 诊断：累计本次扫描中断的忙时 */
 #endif
     return true;
+}
+
+/* 栅极链播种：SIg 依次移入 1,1,0,0,0（5 个 CLKg 脉冲）。调用点两处：
+ *   · engineStart()：扫描还没跑起来，先给栅极链一个确定的初始图案（第一帧就要正确）；
+ *   · triggerThunk()：**整帧最后一次扫描**（_scan == 42）的"点亮起点"闹钟到点时。
+ *
+ * ⚠️ 顺序很关键（实物照片定位出来的 bug）：原驱动 `VFD_GP1211AI::timerHandler()`
+ *    在帧首是"先 5 个播种脉冲（SIg=1,1,0,0,0），再发前进脉冲"。本移植原来写成
+ *    "先前进一步、再播种 5 个"，当时以为"移位可交换"——**错了**：一帧共 48 次移位，
+ *    送进链的**位序列**不同：先播种 ⇒ 那对 1 落在链位 (43,44)；先前进 ⇒ (44,45)。
+ *    差一个位置 = 每帧所有栅极对整体错开一格 = **画面水平错 3 列**。
+ *    现在播种放在 A42 之后、A0 之前（与"帧首 A0 之前"是同一个位置：这两点之间没有别的
+ *    CLKg 上升沿）⇒ 移位顺序仍是 [A41, A42, 播种×5, A0]，逐位等价、画面相位不变。
+ *    为什么必须从帧首挪到帧末：低亮度落点要求"边界四步 → 搬运紧跟"，边界 ~5 + 搬运 87 µs
+ *    已经吃满 91 µs 的消隐窗口，帧首再插 20 µs 播种就会越过点亮起点（Note 7②）。
+ *    为什么又必须等到"点亮起点"才播（而不是紧跟 A42）：紧跟 A42 会让播种组与 A42 的前进
+ *    脉冲并成一组（SIg 采样 0,1,1,0,0,0）—— LA 判读把它读成"先前进攻再播种"（= 画面水平
+ *    错 3 列），而 pio 引擎（实机验证过）的形态是"播种 5 个紧跟帧首那 1 个前进"（1,1,0,0,0,0）。
+ *
+ * ⚠️ 引脚空闲电平（pio 版栽过的地方，见提交 bc3acfc）：播种末步 = 第 5 个脉冲，
+ *    vfdStrobe() 的两个电平都显式保持 ⇒ 结束时 **CLKg 停在"高"**（空闲电平）、SIg = 0，
+ *    全程 LAT 保持低（这 5 次链搬运不会锁存到屏幕上）。边界 ④ 收尾同样是 CLKg 高、LAT 低。 */
+void __not_in_flash_func(Rp2040Platform::seedGrid)()
+{
+    gpio_put(_cfg.pin_sig, 1);
+    vfdStrobe(_cfg.pin_clkg); /* 第 1 个脉冲 */
+    vfdStrobe(_cfg.pin_clkg); /* 第 2 个脉冲 */
+    vfdSigHoldDelay();        /* SIg 保持时间（手册 tDH >= 30 ns）*/
+    gpio_put(_cfg.pin_sig, 0);
+    vfdStrobe(_cfg.pin_clkg); /* 第 3 个脉冲 */
+    vfdStrobe(_cfg.pin_clkg); /* 第 4 个脉冲 */
+    vfdStrobe(_cfg.pin_clkg); /* 第 5 个脉冲；收尾 **CLKg = 高**（空闲电平）*/
 }
 
 /* ------------------------------------------------------------------ 诊断 */

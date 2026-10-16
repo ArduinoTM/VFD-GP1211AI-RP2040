@@ -1,5 +1,6 @@
 /*
- * 宿主机测试：PIO 引擎"帧末播种请求"的时序窗口（CPU 标志脚 vs PIO 的 `jmp pin` 检查点）
+ * 宿主机测试：PIO 引擎"帧末播种"的时序模型 —— 含 2026-10-08 之前请求脚窗口的**历史模型**，
+ * 以及现行 25 条 PIO 程序的结构断言（后者才是防回归的活判据）。
  *
  * 背景（2026-10-05 由逻辑分析仪实测发现）：
  *   PIO 版固件里 SIg **恒为 0**（475 ms / 58 帧内没有任何播种脉冲）⇒ 栅极链每帧只被推进 43 次、
@@ -15,9 +16,9 @@
  *
  * 本测试用一个纯软件时序模型（坐标：t=0 = 目标帧第一次扫描的起点）验证：
  *   [0] 设计前提：DMA 完成中断落在本帧最后一次扫描内；
- *   [1] 旧窗口必须**看不到任何检查点**（复现实测现象）；
- *   [2] 新窗口必须**恰好跨过帧首扫描的那一次检查**；
- *   [3..5] 早/晚抖动、保持时间变化时的容差边界。
+ *   [1] 现行播种落点：CPU 自旋等 SM 停进 wait 之后再播种 ⇒ 整组必须在本扫描边界之后、
+ *       帧首扫描起点之前完成，且装得进消隐下限。真机判据另见 tests/tools/check_seed_window.js：
+ *       从 LA 抓包量"播种组是否整组落在 BK 消隐窗口内、期间 LAT 是否为低"。
  * 模型参数全部来自 src/vfd_pio_seed_timing.h（与固件同一份常量）。
  */
 #include <stdio.h>
@@ -43,10 +44,9 @@ constexpr double SM_HZ = static_cast<double>(PIO_SEED_SM_HZ_NOMINAL); /* 9.0014 
 constexpr double SCAN_US = static_cast<double>(PIO_SEED_SCAN_PERIOD_US); /* 扫描周期（源自 vfd_hw_spec.h） */
 constexpr int SCANS = static_cast<int>(PIO_SEED_SCANS_PER_FRAME);     /* 43 */
 constexpr double WORD_US = (32.0 * 2.0) * 1e6 / SM_HZ;                /* 一个字 = 32bit × 2 周期 */
-constexpr double CHECK_US = PIO_SEED_CHECK_CYCLES * 1e6 / SM_HZ;      /* 检查点在扫描起点之后 */
+constexpr double BOUNDARY_US = PIO_BOUNDARY_CYCLES * 1e6 / SM_HZ;    /* 边界四步距扫描起点 */
 
-/* 检查点相对目标帧第一次扫描起点（t=0）的时刻；scan < 0 表示上一帧的扫描 */
-inline double checkAt(int scan) { return scan * SCAN_US + CHECK_US; }
+
 
 /* 整帧 DMA 完成中断的时刻（相对 t=0）：
  * DMA 要把 516 个字都写进 FIFO，而只有 SM 已取走 (516 - FIFO - OSR) 个字之后
@@ -59,20 +59,6 @@ constexpr double DMA_DONE_US = []
     return -SCAN_US + wordsIntoLastScan * WORD_US;
 }();
 
-/* 窗口内命中的检查点（返回扫描序号；-1 = 一个都没命中） */
-inline int hitIn(double t0, double t1, int fromScan = -1, int toScan = 2)
-{
-    for (int s = fromScan; s <= toScan; ++s) {
-        const double c = checkAt(s);
-        if (t0 <= c && c <= t1)
-            return s;
-    }
-    return -1;
-}
-
-/* 固件里的排程：从 DMA 完成中断到"帧首扫描起点 + PIO_SEED_RAISE_US"的延时。
- * 中断落在本帧最后一次扫描内 ⇒ 它之后的第一个 wrap 就是目标帧第一次扫描的起点。 */
-inline double raiseDelayFromInterrupt() { return -DMA_DONE_US + PIO_SEED_RAISE_US; }
 
 } // namespace model
 
@@ -160,12 +146,25 @@ static void test_lat_polarity()
             check(scanPioDelay(prog[b0 + 2]) == 3 && scanPioDelay(prog[b0 + 3]) == 3,
                 "锁存脉冲宽 [3] = 4 个 SM 周期 = 444 ns ≥ 手册 tWL 300 ns");
         }
-        check(n == 25, "程序只用 25/32 条指令（播种块搬走后余量充足）");
+        check(n == 26, "程序 26/32 条（第 1 步：搬运前多一条 wait，等消隐结束再搬）");
         int waits = 0;
         for (int i = 0; i < n; ++i)
             if ((prog[i] >> 13) == 0x1) /* WAIT 操作码 = 001 */
                 waits++;
-        check(waits == 2, "两条 wait（先等 BK 低、再等 BK 高 = PWM wrap）；⚠️ 省掉任一条都会跑飞（实机停扫）");
+        check(waits == 3, "三条 wait：等点亮 → 等 wrap → 搬运闸门");
+        /* 搬运闸门 = 程序里**第 2 条** `wait 0 pin`（第 1 条是扫描起点），位置必须紧跟边界四步：
+         * CPU 侧（applyXferGate()）就是按这个位置打补丁（低亮度改成 nop）⇒ 结构一动就要在这里拦下。 */
+        {
+            int gateAt = -1, nLow = 0;
+            for (int i = 0; i < n; ++i) {
+                if ((prog[i] >> 13) != 0x1) continue;          /* WAIT 操作码 = 001 */
+                if (((prog[i] >> 7) & 0x1u) != 0u) continue;   /* WAIT 极性在 bit 7（bit 12 属 delay 字段）*/
+                ++nLow;
+                if (nLow == 2) gateAt = i;
+            }
+            check(nLow == 2 && gateAt == b0 + 4,
+                "搬运闸门 = 第 2 条 `wait 0 pin`，紧跟边界四步（下标 b0+4 = 6）⇒ 补丁位置与结构一致");
+        }
         /* 数据段形状：每字节 8 个 out pins + 7 个 nop + 1 个 jmp x-- ⇒ 8 个时钟上升沿 */
         int nOut = 0, nNop = 0, nJmpX = 0, nJmpY = 0;
         for (int i = 0; i < n; ++i) {
@@ -228,30 +227,200 @@ int main()
     /* ---- 0. 播种时机（本方案的关键）：帧首播种改由 CPU 在 DMA 完成中断里直接翻引脚完成。
      *         该中断必定落在本帧最后一次扫描内 ⇒ 播种正好滑进"上一个扫描的边界之后、
      *         帧首扫描的边界之前"，这一顺序决定帧首那对 1 落在链位 (43,44)（见 [7]）。 ---- */
-    printf("[0] 播种时机：DMA 完成中断 → seedGrid()（11 步 × 1 µs ≈ 15 µs）\n");
+    printf("[0] 播种时机：DMA 完成中断 → seedGrid()（11 步 × 1.02 µs ≈ 11.2 µs；末步停在 CLKg 高）\n");
     check(DMA_DONE_US > -SCAN_US && DMA_DONE_US < 0.0,
         "DMA 完成中断落在本帧最后一次扫描周期内（-189 < t < 0）");
-    check(DMA_DONE_US + 15.0 < 0.0,
-        "播种（≈15 µs）在帧首扫描的边界（t=0）之前完成 ⇒ 顺序 = 先播种、后前进");
+    check(DMA_DONE_US + 12.3 < 0.0,
+        "播种（≈12.2 µs）在帧首扫描的边界（t=0）之前完成 ⇒ 顺序 = 先播种、后前进");
     check(DMA_DONE_US > -SCAN_US + 3.0,
         "播种开始于最后一次扫描的边界之后（四步边界只占 ~2 µs）⇒ 不会与边界抢写引脚");
 
-    /* ---- [1] 播种窗口约束 (a)~(d)：vfd_pio_seed_timing.h 声明「测试会全部验证一遍」，
-     *          但此前 hitIn()/raiseDelayFromInterrupt() 定义了却**从未被调用** —— 一条都没断言。
-     *          窗口 = [RAISE_US, RAISE_US + HOLD_US]（相对目标帧首扫描起点 t=0）；
-     *          检查点每 SCAN_US 出现一次，帧首那个在 t = CHECK_US（≈0.22 µs）。 ---- */
-    printf("  播种窗口：raise=%+d µs, hold=%u µs, 帧首检查点 t=%+.2f µs, 扫描 %.0f µs\n",
-        static_cast<int>(PIO_SEED_RAISE_US), static_cast<unsigned>(PIO_SEED_HOLD_US), CHECK_US, SCAN_US);
+    /* ---- [1] 搬运落点"两选一"（选项 C）：播种永远紧跟"搬运用完"之后，差别只在搬运落在
+     *          点亮窗口（高亮度，手册 Figure 5）还是消隐窗口（低亮度）。
+     *          坐标：t=0 = 目标帧第一次扫描起点；本帧最后一次扫描 = [-SCAN_US, 0)。
+     *          模型与实测依据见 src/vfd_pio_seed_timing.h 的落点说明。 ---- */
+    printf("  落点模型：搬运 %u µs（%u 周期）· 边界 %u µs · 播种 %u µs · 落点边界 %u / %u µs\n",
+        static_cast<unsigned>(vfd::PIO_XFER_US), static_cast<unsigned>(vfd::PIO_XFER_CYCLES),
+        static_cast<unsigned>(vfd::PIO_BOUNDARY_US), static_cast<unsigned>(vfd::PIO_SEED_TOTAL_US),
+        static_cast<unsigned>(vfd::PIO_LIT_LOW_MAX_US), static_cast<unsigned>(vfd::PIO_LIT_HIGH_MIN_US));
     {
-        const double t0 = PIO_SEED_RAISE_US;
-        const double t1 = PIO_SEED_RAISE_US + static_cast<double>(PIO_SEED_HOLD_US);
-        check(t0 < CHECK_US, "(a) 拉高必须早于帧首扫描的检查点");
-        check(t1 > CHECK_US, "(b) 窗口必须跨过该检查点（否则这一帧不播种）");
-        check(t1 > 0.0 && hitIn(t0, t1, -1, -1) == -1,
-            "(c) 窗口不覆盖上一次检查点（否则重复播种）");
-        check(t1 < SCAN_US + CHECK_US, "(d) 下一次检查点之前已撤掉（否则每帧多播一次 → 画面错位）");
-        check(hitIn(t0, t1) == 0, "窗口恰好命中帧首扫描（且只命中它）");
-        check(raiseDelayFromInterrupt() > 0.0, "排程延时为正：DMA 完成中断在前，拉高在后");
+        const double periodUs = static_cast<double>(vfd::PIO_SEED_SCAN_PERIOD_US);
+        const double xferUs = static_cast<double>(vfd::PIO_XFER_US);
+        check(BOUNDARY_US < 3.0, "边界四步在扫描起点之后 ≈0.22 µs 开始、≈2 µs 内结束");
+        check(static_cast<double>(vfd::PIO_LIT_LOW_MAX_US) + vfd::PIO_BOUNDARY_US + xferUs <= periodUs,
+            "落点一：点亮上限 + 边界 + 搬运 ≤ 扫描周期 ⇒ 搬运不越进点亮窗口");
+        check(static_cast<double>(vfd::PIO_LIT_HIGH_MIN_US)
+                >= xferUs + vfd::PIO_SEED_START_US + vfd::PIO_SEED_TOTAL_US,
+            "落点二：点亮下限 ≥ 搬运 + 播种起点延迟 + 播种总时长 ⇒ 播种不被 wrap 切断");
+        /* 实测复核（2026-10-17 抓包 Timing-PIO-brightness_0.csv：点亮 108.02 / 消隐 81.02 µs）：
+         *   搬运末沿 = 点亮起点 + 86.78 µs；播种首沿 = 搬运末沿（CLKa 末沿）+ 1.88 µs；
+         *   播种末沿距下一条 BK 上升沿 9.48 µs。 */
+        const double measuredSeedEnd = 86.78 + 1.88 + 11.22; /* 相对点亮起点（11 步 × 1.02 µs）*/
+        check(measuredSeedEnd < static_cast<double>(vfd::PIO_LIT_HIGH_MIN_US),
+            "实测播种末沿 ≈100.9 µs < 落点二下限 102 µs ⇒ 下限不是纸上数字");
+        check(static_cast<double>(vfd::PIO_LIT_LOW_MAX_US) + 88.6 < 189.04,
+            "实测低亮度落点：上限 98 µs 时搬运 ≈88.6 µs 仍早于点亮起点（余量 ≈2.4 µs）");
+    }
+
+    /* ---- [9] 选项 C：亮度 20%–80% 映射（两段线性 + 跳过死区）---- */
+    {
+        printf("[9] 亮度映射：20%%–80%%（%u–%u µs），两段线性 + 死区跳过（切换点 b=%u）\n",
+            static_cast<unsigned>(vfd::PIO_LIT_MIN_US), static_cast<unsigned>(vfd::PIO_LIT_MAX_US),
+            static_cast<unsigned>(vfd::PIO_LIT_SPLIT_B));
+        check(vfd::PIO_LIT_MIN_US == 38u && vfd::PIO_LIT_MAX_US == 151u,
+            "点亮区间 = 38–151 µs（正好 20% / 80% 档）");
+        check(vfd::PIO_LIT_LOW_MAX_US == 98u && vfd::PIO_LIT_HIGH_MIN_US == 102u,
+            "两个落点边界 = 98 / 102 µs（死区 4 µs ≈2% 占空比）");
+        check(vfd::pioLitWindowUs(0) == 38u && vfd::pioLitWindowUs(255) == 151u,
+            "端点：b=0 → 20%、b=255 → 80%");
+        bool mono = true, oneJump = false;
+        unsigned distinct = 0, prev = 0;
+        for (unsigned b = 0; b <= 255u; ++b) {
+            const unsigned lit = vfd::pioLitWindowUs(b);
+            if (b != 0u) {
+                if (lit < prev) mono = false;
+                if (lit > prev + 1u) oneJump = true;
+                if (lit != prev) ++distinct;
+            }
+            prev = lit;
+        }
+        check(mono, "映射单调不减（255 档逐点检查）");
+        check(oneJump, "死区只表现为一次向上跳变（98 → 102 µs）");
+        check(distinct >= 105u, "可分辨档位 ≥105（低段 61 + 高段 50）");
+        check(vfd::pioLowBrightnessMode(vfd::pioLitWindowUs(140u))
+                && !vfd::pioLowBrightnessMode(vfd::pioLitWindowUs(141u)),
+            "落点切换点 = b 140/141（低亮度段 ≤52%、高亮度段 ≥54%）");
+    }
+
+    /* ---- [10] tick 引擎跟进选项 C（2026-10-17）：落点两选一 + 帧末播种，与 pio 同形 ----
+     * 纯软件模型（坐标：t=0 = 本扫描周期起点 = BK 变高 = 消隐起点）：
+     *   ① 低亮度（点亮 ≤ TICK_LIT_LOW_MAX_US）：搬运紧跟边界 ⇒ 末沿必须早于点亮的起点；
+     *   ② 高亮度（点亮 ≥ PIO_LIT_HIGH_MIN_US）：一次性闹钟等 BK 变低再触发 ⇒ 搬运整段在
+     *      点亮窗口内、且在下一次边界（= 扫描周期末）之前搬完；
+     *   ③ 帧末播种（边界之后 ≈5 µs 起、≈21 µs 长）必须整段落在消隐窗口内 —— 两种落点都要成立；
+     *   ④ 四档验收（0x00/0x80/0xA0/0xFF）的落点必须正好是 消隐/消隐/点亮/点亮。 */
+    printf("[10] tick 引擎（定时器+SPI+DMA）：选项 C 落点模型（搬运 %u µs · 边界 %u µs · 播种 %u µs）\n",
+        static_cast<unsigned>(vfd::TICK_XFER_US), static_cast<unsigned>(vfd::TICK_BOUNDARY_US),
+        static_cast<unsigned>(vfd::TICK_SEED_TOTAL_US));
+    {
+        const double periodUs = static_cast<double>(vfd::PIO_SEED_SCAN_PERIOD_US);
+        const double xferUs = static_cast<double>(vfd::TICK_XFER_US);
+        const double boundaryUs = static_cast<double>(vfd::TICK_BOUNDARY_US);
+        const double seedUs = static_cast<double>(vfd::TICK_SEED_TOTAL_US);
+        /* 搬运真实耗时（头文件的常量是保守进位）：384 bit @ 4.464 MHz */
+        const double realXferUs = 384.0 * 1e6 / (125.0e6 / 28.0);
+        check(vfd::TICK_XFER_US >= realXferUs + 0.9,
+            "搬运常量是保守进位（≥ 实测 384 bit @ 4.464 MHz ≈86.0 µs）");
+
+        bool lowOk = true, highOk = true, seedOk = true;
+        unsigned lowCount = 0, highCount = 0;
+        for (unsigned b = 0; b <= 255u; ++b) {
+            const unsigned lit = vfd::pioLitWindowUs(b);
+            const double litUs = static_cast<double>(lit);
+            /* 帧末播种（等"点亮起点 + 触发延迟"之后播）整段在**点亮窗口**内 —— 两种落点都查 */
+            if (litUs < vfd::TICK_TRIG_DELAY_US + seedUs)
+                seedOk = false;
+            if (vfd::tickLowBrightnessPlacement(lit)) {
+                ++lowCount;
+                /* 落点一：搬运紧跟边界 ⇒ 末沿必须早于点亮起点 */
+                if (boundaryUs + xferUs > periodUs - litUs)
+                    lowOk = false;
+            } else {
+                ++highCount;
+                /* 落点二：点亮窗口装得下 搬运 + 触发延迟 + 收尾；且触发点在本周期内 */
+                if (litUs < xferUs + vfd::TICK_TRIG_DELAY_US + vfd::TICK_XFER_TAIL_US)
+                    highOk = false;
+                if ((periodUs - litUs) + vfd::TICK_TRIG_DELAY_US + xferUs > periodUs)
+                    highOk = false;
+            }
+        }
+        check(lowOk, "低亮度落点：255 档逐点检查，边界 + 搬运 ≤ 消隐窗口（搬运不越进点亮窗口）");
+        check(highOk, "高亮度落点：255 档逐点检查，搬运 + 触发延迟 + 收尾 ≤ 点亮窗口");
+        check(seedOk, "帧末播种整段落在点亮窗口内（最紧 20% 档：点亮 38 µs ≥ 触发延迟+播种 22 µs）");
+        check(lowCount + highCount == 256u && lowCount > 100u && highCount > 100u,
+            "两段亮度都非空（低/高亮度档位数量合理）");
+
+        /* 四档验收：与 pio 的四档表逐项对齐（tests/captures/README.md）*/
+        const unsigned probe[4] = { 0x00u, 0x80u, 0xA0u, 0xFFu };
+        const unsigned wantLit[4] = { 38u, 92u, 110u, 151u };
+        const bool wantLow[4] = { true, true, false, false };
+        bool probesOk = true;
+        for (int i = 0; i < 4; ++i) {
+            const unsigned lit = vfd::pioLitWindowUs(probe[i]);
+            const bool low = vfd::tickLowBrightnessPlacement(lit);
+            if (lit != wantLit[i] || low != wantLow[i])
+                probesOk = false;
+            printf("     0x%02X → 点亮 %3u µs（消隐 %3u）· 落点 %s\n", probe[i], lit,
+                static_cast<unsigned>(vfd::PIO_SEED_SCAN_PERIOD_US) - lit,
+                low ? "消隐窗口内" : "点亮窗口内");
+        }
+        check(probesOk, "四档验收（0x00/0x80/0xA0/0xFF）⇒ 点亮 38/92/110/151 µs、落点 消隐/消隐/点亮/点亮");
+
+        /* 实测复核（2026-10-17 tick 四档抓包，样本 golden-tick-89ad18a.csv.gz，固件 89ad18a）：
+         *   · 引脚上 BK↑ → 首个 CLKa 沿 = 6.2…6.6 µs（0x00/0x80；高亮度档是闹钟触发，另算）；
+         *   · 低亮度落点"最后一次 CLKa 沿 → BK↓"余量 = 58.64（0x00）/ 4.64（0x80）µs；
+         *   · 点亮窗口 = 38.02 / 92.02 / 110.02 / 151.04 µs（与映射逐档吻合）。
+         * 注意：这个 6.6 µs 里含"等 BK 在引脚上变高"（≈0.4 µs）与让位（实测 ≈2.2 µs）——
+         * 后者把低亮度落点上限从 97 压到 95（TICK_LIT_LOW_MAX_US 就是这么来的）。 */
+        const double measuredBoundaryUs = 6.6; /* 抓包实测（引脚上 BK↑ → 首个 CLKa 沿） */
+        check(measuredBoundaryUs <= static_cast<double>(vfd::TICK_BOUNDARY_US),
+            "实测复核：BK↑ → 首个 CLKa 沿 6.6 µs ≤ 保守常量 7 µs");
+        const double litLowBlank = periodUs - static_cast<double>(vfd::TICK_LIT_LOW_MAX_US); /* 94 µs */
+        check(litLowBlank - (measuredBoundaryUs + realXferUs) > 1.0,
+            "实测复核：tick 低亮度上限（95 µs）档搬运末沿仍比点亮起点早 >1 µs");
+        const double lit92Blank = periodUs - 92.0; /* 0x80 档消隐 97 µs */
+        check(lit92Blank - (measuredBoundaryUs + realXferUs) > 4.0,
+            "实测复核：0x80 档（点亮 92 µs）余量 >4 µs（抓包实测 4.64 µs）");
+    }
+
+    /* ---- [11] 帧末播种与"帧首先播种"**逐位等价**（画面相位不变的证明）----
+     * 栅极链 = 48 位移位寄存器，每帧正好 48 次 CLKg 上升沿（43 次边界前进 + 5 次播种）。
+     * 链在某个锁存点的"内容"就是**最近 48 个 SIg 位**（先入链的走得更远）。
+     *   A 方案（原 tick）：帧首 = 播种 5 拍，再 A0…A42 —— 帧内第 0…4 拍是播种；
+     *   B 方案（现行 tick/pio）：A0…A42，帧末（A42 之后）播种 —— 帧内第 43…47 拍是播种。
+     * 断言：两种方案在 A0…A42 这 43 个锁存点上的 48 位链内容**逐位相同**。
+     * （历史 bug 的边界情形另见 [7]：帧首"先前进攻再播种"会整体错一格 = 画面水平错 3 列。）*/
+    printf("[11] 帧末播种 vs 帧首先播种：43 个锁存点的链内容逐位比对\n");
+    {
+        const unsigned kScans = static_cast<unsigned>(vfd::PIO_SEED_SCANS_PER_FRAME); /* 43 */
+        const unsigned kSeed = 5;
+        /* 每帧 48 拍：第 i 拍对应的 SIg 位 + 是不是锁存点（A0…A42）*/
+        auto chainAtLatches = [&](bool seedAtFrameEnd, uint64_t out[kScans + 8]) {
+            unsigned latches = 0;
+            uint64_t history = 0; /* 最近 48 个 SIg 位（新位进低位）*/
+            for (unsigned frame = 0; frame < 3; ++frame) {
+                for (unsigned k = 0; k < kScans + kSeed; ++k) {
+                    unsigned sig = 0;
+                    bool isLatch = false;
+                    if (!seedAtFrameEnd) {
+                        /* 帧首：第 0…4 拍是播种（1,1,0,0,0），第 5…47 拍是 A0…A42 */
+                        if (k < kSeed)
+                            sig = (k < 2u) ? 1u : 0u;
+                        else
+                            isLatch = true;
+                    } else {
+                        /* 帧末：第 0…42 拍是 A0…A42，第 43…47 拍是播种 */
+                        if (k < kScans)
+                            isLatch = true;
+                        else
+                            sig = ((k - kScans) < 2u) ? 1u : 0u;
+                    }
+                    history = ((history << 1) | sig) & 0xFFFFFFFFFFFFull; /* 48 位 */
+                    if (isLatch && frame > 0 && latches < kScans)
+                        out[latches++] = history;
+                }
+            }
+            return latches;
+        };
+        static uint64_t ha[kScans + 8], hb[kScans + 8];
+        const unsigned na = chainAtLatches(false, ha);
+        const unsigned nb = chainAtLatches(true, hb);
+        check(na == kScans && nb == kScans, "两种方案各取到 43 个锁存点的链快照");
+        unsigned same = 0;
+        for (unsigned i = 0; i < kScans && i < na && i < nb; ++i)
+            if (ha[i] == hb[i])
+                ++same;
+        check(same == kScans, "帧末播种与帧首先播种：43/43 个锁存点的 48 位链内容完全相同（画面相位不变）");
     }
 
     /* [7] 位**顺序**（不是只数个数！）——2026-10-05 实物照片定位出的 bug：
@@ -310,6 +479,7 @@ int main()
     }
 
     check(SCANS == 43, "一帧 43 次扫描；每帧移位总数 43 + 5 = 48 = 栅极链长度（图案自复位）");
+    /* 注：[9] 亮度映射块紧跟在 [1] 落点块之后（见上）。 */
 
     test_lat_polarity();
     test_scan_phase();

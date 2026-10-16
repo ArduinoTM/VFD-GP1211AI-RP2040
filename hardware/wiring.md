@@ -129,6 +129,7 @@ cmake -S . -B build -DPICO_SDK_PATH=/path/to/pico-sdk \
 ```powershell
 node tests/tools/analyze_la_csv.js <CSV>                            # 通道名：Time[s], CLKa, SIa, LAT, CLKg, SIg, BK, HVEN, FLEN
 node tests/tools/analyze_la_csv.js <CSV> --window 0.0024 0.000006   # 转储 2.4 ms 附近 ±3 µs 的原始样本
+node tests/tools/check_seed_window.js <CSV>                       # 播种落点：段内是否被 BK 边沿打断、LAT 是否全程低、到帧首锁存余量（现行机制的真机判据）
 ```
 
 它会打印各信号电平宽度、CLKg 脉冲分组（1 连发 / 6 连发）、每帧脉冲总数、SIg 变化点与段宽、

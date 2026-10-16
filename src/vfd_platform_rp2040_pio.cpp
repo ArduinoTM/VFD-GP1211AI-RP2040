@@ -45,18 +45,24 @@ void Rp2040Platform::patchProgramPins(uint16_t *words, uint length)
     const uint16_t realLow = static_cast<uint16_t>(pio_encode_wait_pin(false, _cfg.pin_bk));
     const uint16_t realHigh = static_cast<uint16_t>(pio_encode_wait_pin(true, _cfg.pin_bk));
 
-    uint patched = 0;
+    uint lowPatched = 0;
+    uint highPatched = 0;
     for (uint i = 0; i < length; ++i) {
         if (words[i] == placeholderLow) {
             words[i] = realLow;
-            patched++;
+            ++lowPatched;
         } else if (words[i] == placeholderHigh) {
             words[i] = realHigh;
-            patched++;
+            ++highPatched;
         }
     }
-    /* 应当恰好找到"等 BK 变低"和"等 BK 变高"各一条 */
-    if (patched != 2)
+    /* ⚠️ 2026-10-16：程序里的 wait 不再只有两条（搬运前多了一条"等消隐结束"），
+     * 因此判据从"恰好各一条"改成"**两种极性至少各一条**"：
+     *   · 全部占位都被改写（循环保证）+ 两种极性都在 ⇒ 时序结构成立；
+     *   · 任一极性 0 条 ⇒ .pio 结构与驱动假设不符 ⇒ 报错，绝不静默跑在错误引脚上。
+     * 复盘：旧判据 patched != 2 会让任何"wait 数量变化"的改动直接 engineError，
+     * 而 engineStart() 见到 engineError 就 return ⇒ 状态机不使能 ⇒ 表现为"只有 BK 跳变"。 */
+    if (lowPatched == 0 || highPatched == 0)
         _engineError = true;
 }
 
@@ -96,6 +102,28 @@ void Rp2040Platform::engineInit()
     patchProgramPins(words, length);
     if (_engineError)
         return;
+
+    /* ---- 1b. 定位"搬运闸门"（程序里**第 2 条** `wait 0 pin BK`，第 1 条是扫描起点的那个）----
+     * 低亮度形态要把闸门改成 `nop`（见 vfd_pio_seed_timing.h 的落点说明）。
+     * 与 patchProgramPins 同思路：按**编码比对**定位 ⇒ .pio 结构变了就报错，
+     * 绝不静默把补丁写到别的指令上（宁可 engineError 停机，也不要画面悄悄错）。 */
+    _gateWaitWord = static_cast<uint16_t>(pio_encode_wait_pin(false, _cfg.pin_bk));
+    _gateNopWord = static_cast<uint16_t>(pio_encode_nop());
+    _gateOffset = -1;
+    {
+        uint seen = 0;
+        for (uint i = 0; i < length; ++i) {
+            if (words[i] == _gateWaitWord && ++seen == 2u) {
+                _gateOffset = static_cast<int>(i);
+                break;
+            }
+        }
+    }
+    _gateLowApplied = false; /* 刚装进去的程序里闸门是 `wait 0 pin BK` = 高亮度形态 */
+    if (_gateOffset < 0) {
+        _engineError = true;
+        return;
+    }
 
     pio_program_t prog = vfd_scan_program;
     prog.instructions = words;
@@ -160,31 +188,59 @@ void Rp2040Platform::engineInit()
         _dmaIrqReady = true;
     }
 
-    /* ---- 6. 消隐裕量自检（按最坏情况：帧末还要播种）---- */
+    /* ---- 6. 余量诊断（现行时序：搬运整段落在点亮窗口内）----
+     * 报的余量 = 点亮窗口 − 搬运用时（不是旧的"消隐 − 工作量"）。
+     * ⚠️ 只算数、**不新增 _engineError 条件**：任何新判错都会让 engineStart() 直接 return、
+     *    状态机不使能而表现为"只有 BK 跳变"（2026-10-16 已踩两次）。区间自洽性由
+     *    vfd_pio_seed_timing.h 的 static_assert 在编译期保证。 */
     const uint32_t smHz = _pioClkHz * 2u;
-    const uint32_t workUs = ((PIO_SCAN_WORK_CYCLES + PIO_SEED_CYCLES) * 1000000u)
-            / (smHz ? smHz : 1u)
-        + 1u;
-    if (_cfg.blank_guard_us <= workUs) {
-        _cfg.blank_guard_us = workUs + 4u; /* 自动抬高，避免违反 Note 7② */
-        _guardMarginUs = 4u;
-    } else {
-        _guardMarginUs = _cfg.blank_guard_us - workUs;
-    }
+    const uint32_t xferUs = (PIO_XFER_CYCLES * 1000000u + (smHz ? smHz : 1u) - 1u) / (smHz ? smHz : 1u);
+    const uint32_t litUs = _litWindowUs ? _litWindowUs : PIO_LIT_MIN_US;
+    const uint32_t blankUs = PIO_SEED_SCAN_PERIOD_US > litUs ? PIO_SEED_SCAN_PERIOD_US - litUs : 0u;
+    /* 两种落点各报各的"搬运用完之后的剩余窗口"：
+     *   落点二（高亮度）：点亮 − 搬运（播种要紧随其后，窗口就是它）；
+     *   落点一（低亮度）：消隐 − 边界 − 搬运（播种窗口还要大得多，见头文件说明）。 */
+    _guardMarginUs = pioLowBrightnessMode(litUs)
+        ? (blankUs > PIO_BOUNDARY_US + xferUs ? blankUs - PIO_BOUNDARY_US - xferUs : 0u)
+        : (litUs > xferUs ? litUs - xferUs : 0u);
 
-    /* ---- 7. 播种请求窗口自检 ----
-     * 检查点在扫描起点之后 checkUs；请求脚窗口 [raise, raise+hold] 必须
-     *   (a) 跨过 checkUs（否则 PIO 看不到请求 → 完全不播种）；
-     *   (b) 在下一次检查点（扫描周期 + checkUs）之前结束（否则每帧多播一次 → 画面错位）。
-     * 若 CLKa 取得很低（checkUs 接近甚至超过扫描周期），这套握手就不成立，直接报错。 */
-    const uint32_t checkUs = (PIO_SEED_CHECK_CYCLES * 1000000u) / (smHz ? smHz : 1u);
-    const uint32_t nextCheckUs = _cfg.scan_period_us + checkUs;
-    if (checkUs >= _cfg.scan_period_us
-        || static_cast<int32_t>(PIO_SEED_RAISE_US) > 0
-        || (PIO_SEED_RAISE_US + static_cast<int32_t>(PIO_SEED_HOLD_US)) <= static_cast<int32_t>(checkUs)
-        || (PIO_SEED_RAISE_US + PIO_SEED_HOLD_US) >= nextCheckUs) {
-        _engineError = true;
+}
+
+/* 切换"搬运闸门"：低亮度形态把它换成 `nop`（搬运紧跟边界四步、整段落进消隐窗口），
+ * 高亮度形态换回 `wait 0 pin BK`（搬运整段落在点亮窗口内 = 手册 Figure 5）。
+ *
+ * ⚠️ 这是**直接写 PIO 指令存储**，只能在状态机停在 `wait` 上时做：
+ *   · engineStart()：状态机还没使能；
+ *   · 帧末中断：调用点已经自旋等到 PC ≤ 1（两条 wait 之一）；
+ *   · setBrightness()：applyBrightnessMode() 先自旋等 PC ≤ 1，等不到（超时 2 个扫描周期）
+ *     就放弃、留给帧末中断。
+ *   从写入到 SM 取到这条指令至少隔 18 个周期（PC 0/1 → 边界四步 → 闸门）⇒ 不会撞上取指。
+ *   RP2040 手册把"运行中写指令存储"列为未定义行为，所以这条纪律必须守住：
+ *   **任何新增调用点都要先保证 PC 落在 wait 上**。 */
+void __not_in_flash_func(Rp2040Platform::applyXferGate)()
+{
+    if (_pioOffset < 0 || _gateOffset < 0)
+        return;
+    const bool low = pioLowBrightnessMode(_litWindowUs ? _litWindowUs : PIO_LIT_MIN_US);
+    if (low == _gateLowApplied)
+        return;
+    _cfg.pio->instr_mem[static_cast<uint>(_pioOffset) + static_cast<uint>(_gateOffset)] =
+        low ? _gateNopWord : _gateWaitWord;
+    _gateLowApplied = low;
+}
+
+/* 亮度变了 ⇒ 本扫描周期内就把落点切过去，避免"新亮度 + 旧落点"的那一帧里搬运跨过
+ * BK 边沿（Note 7②）。等不到状态机停等就交给帧末中断（下个帧边界必到）。 */
+void __not_in_flash_func(Rp2040Platform::applyBrightnessMode)()
+{
+    if (_pioOffset < 0 || _gateOffset < 0 || _engineError)
+        return;
+    const uint32_t base = static_cast<uint32_t>(_pioOffset);
+    const uint32_t deadline = time_us_32() + 2u * static_cast<uint32_t>(PIO_SEED_SCAN_PERIOD_US);
+    while ((pio_sm_get_pc(_cfg.pio, _cfg.sm) - base) > 1u
+        && static_cast<int32_t>(time_us_32() - deadline) < 0) {
     }
+    applyXferGate();
 }
 
 void Rp2040Platform::engineStart()
@@ -194,7 +250,8 @@ void Rp2040Platform::engineStart()
 
     _active = _published ? _published : reinterpret_cast<const uint8_t *>(_blankFrame);
 
-    seedGrid(); /* 先给栅极链播一次种，让第一帧就正确 */
+    applyXferGate(); /* 状态机还没使能 ⇒ 安全的补丁时机（落点按当前亮度）*/
+    seedGrid();      /* 先给栅极链播一次种，让第一帧就正确 */
 
     pio_sm_clear_fifos(_cfg.pio, _cfg.sm);
     /* 让程序从 .wrap_target（scan:）重新开始：复位 PC + 循环计数，
@@ -244,28 +301,39 @@ void Rp2040Platform::engineDeinit()
  *    nm 核对：修复前 seedGrid 在 0x10004xxx（Flash），修复后在 0x2000xxxx（RAM）。 */
 void __not_in_flash_func(Rp2040Platform::seedGrid)()
 {
-    const uint32_t lat = 1u << _cfg.pin_lat;
-    const uint32_t clkg = 1u << _cfg.pin_clkg;
-    const uint32_t sig = 1u << _cfg.pin_sig;
-    const uint32_t mask = lat | clkg | sig;
-
-    const uint32_t idle = 0; /* LAT 低（保持）+ CLKg 低 + SIg 低 */
+    /* ⚠️ 这里的值必须是 **PIO set 组内的 3 bit**（bit0=LAT、bit1=CLKg、bit2=SIg），
+     * 与 src/vfd_scan.pio 的 set pins 常量同源 —— **不能**用 GPIO 绝对掩码：
+     * pio_sm_exec 的 set 立即数是"组内偏移"，绝对掩码会被 5 bit 截断（GP5/GP6 直接变 0），
+     * 症状就是"SIg 恒为低、播种完全不动"（2026-10-17 踩过；SDK 的
+     * pio_sm_set_pins_with_mask() 会自动换算，绕过 SDK 就必须自己算）。 */
     const uint32_t steps[] = {
-        clkg | sig, /* SIg=1, CLKg 高（空闲） */
-        sig,        /* CLKg 低 */
-        clkg | sig, /* CLKg 高 -> 第 1 个脉冲 */
-        sig,
-        clkg | sig, /* 第 2 个脉冲 */
-        idle,       /* SIg=0, CLKg 低 */
-        clkg,       /* 第 3 个脉冲 */
-        idle,
-        clkg, /* 第 4 个脉冲 */
-        idle,
-        clkg, /* 第 5 个脉冲 */
-        idle, /* 收尾回空闲 */
+        0x6, /* SIg=1, CLKg 高（空闲） */
+        0x4, /* SIg=1, CLKg 低 */
+        0x6, /* CLKg 高 -> 第 1 个脉冲 */
+        0x4,
+        0x6, /* 第 2 个脉冲 */
+        0x0, /* SIg=0, CLKg 低 */
+        0x2, /* 第 3 个脉冲 */
+        0x0,
+        0x2, /* 第 4 个脉冲 */
+        0x0,
+        0x2, /* 第 5 个脉冲；**收尾必须停在 CLKg 高**（空闲电平，见下）*/
     };
+    /* 2026-10-17（方案 B）：每步只做**一次** SM 注入 —— 原来用 pio_sm_set_pins_with_mask()
+     * 是读-改-写 = 两次注入，12 步合计 ≈31 µs；而播种必须整段塞进"搬运结束 → 帧首 wrap"
+     * 的停等窗口（长度 = 搬运余量，亮度 0 时仅 12 µs）⇒ wrap 落在播种中途、SM 执行边界
+     * set pins 把 SIg 切断 ⇒ 实测每帧两段 SIg、栅极链多前进 5 格 ⇒ 画面错位。
+     * 改为单次 pio_sm_exec 后 ≈15 µs，配合余量抬到 20 µs 即可整段容纳。
+     * tWL >= 300 ns 仍由下面的 1 µs 延时保证。
+     *
+     * 2026-10-17（修 Note 7③ "CLK 为低时不得改变 BK"）：原表最后一步是 `0x0`（CLKg 低）+
+     *   注释"收尾回空闲"—— 但 CLKg 的**空闲电平是高**（手册 Figure 3/5、边界 ④ = 0x2）。
+     *   于是播种之后 CLKg 一直低到下一次边界 ①，正好跨过帧首那条 **BK 上升沿** ⇒ 抓包里
+     *   "BK 跳变时 CLKg 为低"每帧 1 次（4 档验收抓包实测：49 次 / 49 帧，距播种末沿 ≈8 µs）。
+     *   删掉那一步（末步 = 第 5 个脉冲的 0x2）⇒ 播种结束即回到空闲高、违规归零，
+     *   顺带把播种从 12 步缩到 11 步（≈11.2 µs）。 */
     for (uint32_t v : steps) {
-        pio_sm_set_pins_with_mask(_cfg.pio, _cfg.sm, v, mask);
+        pio_sm_exec(_cfg.pio, _cfg.sm, pio_encode_set(pio_pins, v));
         rp2040ShortDelayUs(1); /* 满足 tWL >= 300 ns，同时让指令端口不被抢写 */
     }
     /* 最后一个 CLKg 上升沿（第 5 个脉冲）之后，SIg 已为 0；此处再等一拍，
@@ -276,8 +344,15 @@ void __not_in_flash_func(Rp2040Platform::seedGrid)()
 
 void __not_in_flash_func(Rp2040Platform::dmaIrqThunk)()
 {
-    if (_instance != nullptr)
-        _instance->onFrameDmaDone();
+    Rp2040Platform *self = _instance;
+    if (self == nullptr)
+        return;
+    /* ⚠️ 2026-10-17：DMA_IRQ_0 是**所有通道共享**的中断线，必须只认本通道的完成标志 ——
+     * 否则任何别的完成事件都会"多播一次种"（实测 1 s 内 46 次双播种、间隔 12 µs，
+     * 每次让栅极链多前进 5 格 ⇒ 画面错位）。 */
+    if ((dma_hw->ints0 & (1u << static_cast<uint>(self->_cfg.dma_ch))) == 0u)
+        return;
+    self->onFrameDmaDone();
 }
 
 /* 预约"帧首扫描"的播种请求。
@@ -304,6 +379,15 @@ void __not_in_flash_func(Rp2040Platform::dmaIrqThunk)()
 
 void __not_in_flash_func(Rp2040Platform::onFrameDmaDone)()
 {
+    /* 第二道防护（见 vfd_pio_seed_timing.h）：距上次帧中断太近 ⇒ 判为杂散/重复进入，
+     * **整段跳过** —— 不能只跳播种，否则帧计数与换缓冲也会被多算一次（抓包里正是
+     * 46 个帧只有 42 个扫描）。 */
+    {
+        const uint32_t nowUs = time_us_32();
+        if (!seedAllowedByInterval(nowUs, _lastFrameIrqUs))
+            return;
+        _lastFrameIrqUs = nowUs;
+    }
 #if VFD_DEBUG_DIAG
     const uint32_t irqT0 = time_us_32(); /* 诊断：ISR 忙时累计起点（VFD_DEBUG_DIAG） */
 #endif
@@ -357,6 +441,9 @@ void __not_in_flash_func(Rp2040Platform::onFrameDmaDone)()
         while ((pio_sm_get_pc(_cfg.pio, _cfg.sm) - base) > 1u && ++spins < 20000u) {
         }
     }
+    /* 此刻 PC 一定停在 wait 上 ⇒ 安全的补丁时机：亮度变了就在这里把搬运落点切过去
+     * （setBrightness() 那次自旋没等到时也由这里兜底）。 */
+    applyXferGate();
     seedGrid();
 #if VFD_DEBUG_DIAG
     _irqUs += time_us_32() - irqT0; /* 诊断：累计本次帧完成中断的忙时 */

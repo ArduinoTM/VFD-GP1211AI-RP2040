@@ -1292,14 +1292,17 @@ int main()
         static_cast<unsigned long>(cfg.scan_period_us),
         1e6 / (static_cast<double>(cfg.scan_period_us) * vfd::SCANS_PER_FRAME),
         vfd::SCANS_PER_FRAME);
-    bootPrintf("  lit window: max %lu us of %lu us, blank guard %lu us (margin %lu us)\n",
+    /* 选项 C 起消隐窗口 = 扫描周期 − 点亮窗口（点亮窗口由亮度映射决定，见 vfd_pio_seed_timing.h），
+     * `cfg.blank_guard_us` 两个引擎都不再用 ⇒ 横幅改印**实际最短消隐**（= 峰值亮度的消隐）。*/
+    bootPrintf("  lit window: max %lu us of %lu us, min blank %lu us (margin %lu us)\n",
         static_cast<unsigned long>(platform.litWindowMaxUs()),
         static_cast<unsigned long>(cfg.scan_period_us),
-        static_cast<unsigned long>(cfg.blank_guard_us),
+        static_cast<unsigned long>(cfg.scan_period_us - platform.litWindowMaxUs()),
         static_cast<unsigned long>(platform.guardMarginUs()));
     if (platform.engineError())
         bootPrintf("  !! scan engine init failed - check pin mapping (LAT/CLKg/SIg must be consecutive)\n");
-    /* 栅极链播种：tick 引擎内联在 0 号扫描；pio 引擎用"请求脚 + jmp pin"握手排在帧首扫描 */
+    /* 栅极链播种：两个引擎都在整帧最后一次扫描（帧末）由 CPU 直接翻引脚完成 ——
+     * pio 在整帧 DMA 完成中断里，tick 在最后一次扫描的中断里（选项 C，见 docs/17 §8）。*/
     bootPrintf("  frame-end grid seed: %s\n",
         platform.engineName()[0] == 'p' ? "seed by CPU @ frame end" : "seed inline @ frame end");
 

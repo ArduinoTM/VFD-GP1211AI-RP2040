@@ -15,27 +15,28 @@
  * │   PIO 一个状态机同时产生 CLKa / SIa / CLKg / LAT / SIg：
  * │     · 阳极数据由 DMA 连续灌入 TX FIFO（DREQ 节流，PIO 自己数 48 字节/扫描）
  * │     · 扫描周期由 BK(PWM) 的消隐边沿同步 —— 数据传输天然落在消隐窗口内
- * │     · 帧末的栅极链播种(1,1,0,0,0) 由 CPU 在帧完成中断里直接翻引脚（seedGrid()，2026-10-11 起；
- * │       原先在 PIO 程序里，为腾出 32 条指令而搬走 —— 见 docs/08 §7 的 P6）
+ * │     · 帧末的栅极链播种(1,1,0,0,0) 由 CPU 在帧完成中断里直接翻引脚（seedGrid()，2026-10-08 `da9b6a1` 起；
+ * │       原先在 PIO 程序里（旧版 32 条满额，搬走后程序 25/32）—— 见 docs/08 §7 的 P6）
  * │   CPU 只在一帧结束时进一次中断（123 Hz）：换帧缓冲 + 重启 DMA
  * │   ⇒ 扫描时序不再依赖中断延迟；即使主循环/中断被拖慢，扫描仍按时序进行
  * └
  * 两种引擎的引脚接线完全相同，BK 仍由 PWM 产生消隐/调光。
  *
- * 时序（一个扫描周期 = 189 us，PWM 一个周期也是 189 us）：
+ * 时序（一个扫描周期 = 189 us，PWM 一个周期也是 189 us）—— **选项 C（2026-10-17 两个引擎统一）**：
  *
- *   0 us        PWM wrap → BK 变高（消隐开始）
- *   +0.2–1.5 us 边界四步：CLKg↓ → CLKg↑（栅极前进一位）→ LAT↑（锁存）→ LAT↓（释放）
- *               （pio：两个 wait 之后立即走四步；tick：中断入口直接翻引脚）
- *   ~+1.5–90 us 数据段：把本扫描的 48 字节送入阳极移位链（全程 BK 恒定消隐 ⇒ Note 7②）
- *   100 us      BK 取消消隐 → 本次扫描的 3 列 × 64 行点亮（全亮时；默认亮度 200 为 70 us）
+ *    0 us        PWM wrap → BK 变高（消隐开始）
+ *   +0.2–2 us    边界四步：CLKg↓ → CLKg↑（栅极前进一位）→ LAT↑（锁存）→ LAT↓（释放）
+ *   ┌ 低亮度（点亮 ≤ 97 us）：搬运紧跟边界 ⇒ 整段落在**消隐**窗口内（Note 7②：搬运期间 BK 不变）
+ *   └ 高亮度（点亮 ≥ 102 us）：等 BK 变低（点亮起点）再触发搬运 ⇒ 整段落在**点亮**窗口内
+ *                              （手册 Figure 5 形态；pio 用 wait 指令、tick 用一次性闹钟，都不忙等）
+ *   帧末扫描     栅极链播种 1,1,0,0,0（紧跟边界之后、落在消隐窗口内）
  *   189 us      进入下一扫描
  *
- * “点亮窗口”= 189 - blank_guard_us（默认 89 us），亮度 = 窗口宽度 / 189，最大约 47%。
- * 若要更亮可以调小 blank_guard_us，但必须大于"数据搬运 + 边界四步"的时间：
- * 引擎会在 init() 里自检（`PIO_SCAN_WORK_CYCLES + PIO_SEED_CYCLES` 换算成时间），必要时自动抬高
- * guard 并通过 guardMarginUs() 暴露余量。⚠️ 帧末播种由 CPU 完成、**不占 PIO 周期**，但它同样必须
- * 落在消隐窗口内 —— 当前实现下播种尾巴会跨过点亮起点（手册 Note 7③ 每帧 2 次），见 docs/08 §7 的 P6。
+ * “点亮窗口”不再由 blank_guard_us 决定，而是**亮度**决定的固定映射（20%–80% = 38–151 us，
+ * 两段线性 + 跳过 4 us 死区）——唯一来源是 vfd_pio_seed_timing.h 的 pioLitWindowUs()，
+ * 两个引擎共用。`Rp2040Config::blank_guard_us` 自选项 C 起**两个引擎都不再使用**（保留字段仅为
+ * 配置/横幅兼容，见 docs/07）；消隐窗口 = 189 − 点亮窗口。落点会不会违反 Note 7②，
+ * 由 vfd_pio_seed_timing.h 的 static_assert 在**编译期**保证（tick 的 TICK_* 与 pio 的 PIO_* 各一组）。
  */
 #ifndef VFD_PLATFORM_RP2040_H
 #define VFD_PLATFORM_RP2040_H
@@ -43,6 +44,7 @@
 #include "pico/stdlib.h"
 
 #include "hardware/dma.h"
+#include "hardware/pwm.h" /* BK 电平换算的两个引擎共用 inline（见 rp2040ApplyPwmLevel）*/
 
 /* ---- 扫描引擎选择：0 = tick(定时器+SPI+DMA)，1 = pio ---- */
 #ifndef VFD_SCAN_ENGINE_PIO
@@ -202,6 +204,15 @@ Rp2040Config defaultRp2040Config();
 /* 内部工具：微秒级忙等（只读 1 MHz 计时器，不访问 Flash，可在中断里使用） */
 void rp2040ShortDelayUs(uint32_t us);
 
+/* BK 通道电平换算（**两个引擎唯一来源**）：PWM 输出高 = 消隐、低 = 点亮 ⇒
+ * 比较值 = wrap + 1 − 点亮窗口。定义成 inline 是因为 tick 的扫描中断里要改亮度
+ * （挂起的亮度变更在扫描边界生效，避免"新亮度 + 在途搬运"跨过 BK 边沿 ⇒ Note 7②），
+ * 而中断路径必须整体编译进 .time_critical（不能有一次 Flash 取指）。 */
+static inline void rp2040ApplyPwmLevel(int slice, uint channel, uint32_t wrap, uint32_t litUs)
+{
+    pwm_set_chan_level(static_cast<uint>(slice), channel, static_cast<uint16_t>(wrap + 1u - litUs));
+}
+
 /* 上电采样"测试模式"引脚（VFD_PIN_TEST_MODE）：内部上拉，读到**低电平**表示进入测试模式。
  * 默认（高/悬空）不渲染任何内置测试图像，设备只作为 SSD1306 从机等待主机送画面。 */
 bool rp2040TestModeSelected(uint8_t pin = VFD_PIN_TEST_MODE);
@@ -251,6 +262,14 @@ private:
     void engineStart();  /* 启动扫描 */
     void engineStop();   /* 停止扫描（不改 BK/HV 状态） */
     void engineDeinit(); /* 释放引擎资源（析构用） */
+    /* 搬运落点切换（选项 C，**两个引擎各自实现**，落点判据同源）：
+     *   · pio：把 .pio 里那条搬运闸门在 `wait 0 pin BK`（高亮度：搬运落在点亮窗口内）与
+     *     `nop`（低亮度：搬运落在消隐窗口内）之间切换 —— applyXferGate()；
+     *   · tick：把"本扫描的落点模式"挂起，等下一个扫描边界再与 PWM 一起生效
+     *     （低亮度 = 紧跟边界触发 DMA；高亮度 = 一次性闹钟等 BK 变低再触发）。
+     * 亮度 → 点亮窗口的映射与落点边界都在 vfd_pio_seed_timing.h（唯一来源）。 */
+    void applyXferGate();
+    void applyBrightnessMode();
 
     Rp2040Config _cfg;
 
@@ -281,9 +300,16 @@ private:
 #if VFD_SCAN_ENGINE_PIO
     int _pioOffset;
     bool _dmaIrqReady;
+    volatile uint32_t _lastFrameIrqUs = 0; /* 上次帧完成中断时刻（µs）：每帧只播一次防护 */
     dma_channel_config _dmaConfig;
     uint32_t _pioClkHz;    /* 实际 CLKa 频率 */
     uint32_t _guardMarginUs;
+
+    /* 搬运闸门补丁状态（选项 C）：闸门下标在 engineInit 里按编码定位（.pio 结构变了也不会打错地方）*/
+    int _gateOffset = -1;         /* 程序里第 2 条 `wait 0 pin BK` 的下标；<0 = 未定位 */
+    uint16_t _gateWaitWord = 0;   /* 高亮度形态：等点亮起点再搬 */
+    uint16_t _gateNopWord = 0;    /* 低亮度形态：紧跟边界四步就搬 */
+    bool _gateLowApplied = false; /* 指令存储里当前是不是低亮度形态 */
 
     uint32_t _blankFrame[vfd::FRAME_SIZE / 4]; /* _published 为空时的占位帧（48 字节/扫描 布局） */
     static Rp2040Platform *_instance;          /* 中断里需要实例指针 */
@@ -304,6 +330,18 @@ private:
     void configureDma();
     void startScanTimer();
     void stopScanTimer();
+
+    /* ---- 选项 C：搬运落点两选一（与 pio 同一形态，见 vfd_pio_seed_timing.h）---- */
+    volatile uint32_t _appliedLitUs = 0;    /* 引擎**正在用**的点亮窗口（PWM 与落点都以它为准）*/
+    volatile uint32_t _pendingLitUs = 0;    /* setBrightness 挂起的新点亮窗口（下一个扫描边界生效）*/
+    volatile bool _pendingApply = false;    /* 有挂起的亮度变更；见 applyBrightnessMode() */
+    volatile const uint8_t *_pendingSrc = nullptr; /* 高亮度落点：等一下要触发的那一扫描数据 */
+    volatile bool _alarmDoesXfer = false;   /* 闹钟到点要不要触发搬运（= 高亮度落点）*/
+    volatile bool _seedPending = false;     /* 闹钟到点要不要播种（= 帧末扫描）*/
+    int32_t _trigAlarm = -1;                /* "点亮起点"一次性闹钟 id（<0 = 无）*/
+    static int64_t triggerThunk(alarm_id_t id, void *user_data);
+    void seedGrid();          /* 栅极链播种（帧末扫描边界之后；engineStart 先播一次）*/
+    void triggerScanTransfer(); /* 触发本扫描的 48 字节搬运（低亮度=中断里直接 / 高亮度=闹钟）*/
 #endif
 
     /* ---- 非阻塞上电时序的状态（powerUpBegin/powerUpPoll；0 = 未开始/已完成）---- */

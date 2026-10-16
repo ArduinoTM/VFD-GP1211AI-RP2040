@@ -121,7 +121,7 @@ const rl = readline.createInterface({ input: openCsv(file), crlfDelay: Infinity 
     const clkaIdle = { total: 0, high: 0 }; /* Note 7①：数据段之后 CLKa 应为高 */
     /* Note 7②（真判据）：每个扫描内"最后一次 CLKa 上升沿 → BK 下降沿（点亮开始）"的裕量，
      * 写数据必须早于点亮窗口 ⇒ 裕量应为正；裕量为负 = 点亮窗口内还有 CLKa 活动 ✗ */
-    const n72 = { margin: stats(), scans: 0, litClka: 0 };
+    const n72 = { margin: stats(), scans: 0, litClka: 0, bkInWrite: 0 };
     let lastBkFallT = null;       /* 本次扫描的 BK 下降沿（点亮开始） */
     let scanLastClkaRise = null;  /* 本次扫描内最后一次 CLKa 上升沿 */
     /* CLKa 上升沿附近 SIa 的建立/保持（手册 tDS ≥ 40 ns / tDH ≥ 30 ns） */
@@ -196,9 +196,12 @@ const rl = readline.createInterface({ input: openCsv(file), crlfDelay: Infinity 
                         lastClkaRiseT = t;
                         if (lastSiaT !== null) add(siaSetup, t - lastSiaT);
                         pendingClka.push(t);
-                        /* Note 7②：点亮窗口（BK 低）内的 CLKa 活动 = 违规 */
+                        /* Note 7②（2026-10-17 口径订正）：手册要求 = **数据写入期间 BK 不得变化**，
+                         * 与搬运落在点亮窗口还是消隐窗口无关（选项 C 的两种落点都合规；旧口径
+                         * "点亮窗口内不得有 CLKa 活动"只适用于旧结构，见 docs/17 §6 选项 A）。
+                         * 判据实现：BK 每跳变一次，看它是否落在一条 CLKa 突发内部（CLKa 周期 222 ns，
+                         * 取 0.5 µs 窗）⇒ 记一次"写入期间 BK 变化"。 */
                         scanLastClkaRise = t;
-                        if (v.BK === 0) n72.litClka++;
                     }
                     if (s === 'SIg') {
                         sigEdges.push({ t, to: v[s], clkg: prevV.CLKg, lat: prevV.LAT, bk: prevV.BK });
@@ -225,6 +228,7 @@ const rl = readline.createInterface({ input: openCsv(file), crlfDelay: Infinity 
                         });
                     }
                     if (s === 'BK') {
+                        if (lastClkaRiseT !== null && (t - lastClkaRiseT) < 0.5e-6) n72.bkInWrite++;
                         if (v[s] === 1) {
                             lastBkRiseT = t;
                             /* 扫描结束：结算上一次扫描的 Note 7② 裕量（可为负 = 违规） */
@@ -300,7 +304,7 @@ const MANUAL = [
     { id: 'refresh', req: '≥ 120 Hz（Note 14 扫描不可停）', note: '帧率 = 1 / SIg 播种段间隔（样本不足时退回帧首 6 连发间隔）' },
     { id: 'note16', req: '桁间消隐 ≥ 5 µs', note: 'BK 高电平（消隐）时长' },
     { id: 'note7-1', req: '不写数据时 CLK 为高', note: 'CLKg/LAT 空闲高 + CLKa 数据段之后为高' },
-    { id: 'note7-2', req: '数据写入期间 BK 不得变化', note: '最后一次 CLKa 上升沿必须早于 BK 下降沿（点亮窗口内不得有 CLKa 活动）' },
+    { id: 'note7-2', req: '数据写入期间 BK 不得变化', note: 'BK 跳变不得落在 CLKa 突发内部（与搬运落点在点亮/消隐无关，选项 C 两种落点都合规）' },
     { id: 'note7-3', req: 'CLK 为低时不得改变 BK', note: 'BK 跳变时刻的 CLKg/CLKa 电平' },
     { id: 'note7-4', req: 'LAT 高且 BK 低时不得抬高 CLK', note: '是否存在 LAT 脉冲落在 BK 低（点亮）区间' },
     { id: 'note10-11', req: '另一组阳极必须全 OFF', note: '需解码 SIa（采样率不足）；由宿主机测试保证' },
@@ -447,16 +451,15 @@ function compliance(r) {
         ['Note 7① CLK 空闲高', '不写数据时 CLK 为高',
             'CLKa 在"数据段结束后（+88…118 µs）"为高的样本占比 ' + clkaIdlePct + `%（${r.clkaIdle.high}/${r.clkaIdle.total}）`,
             'CLKg/LAT 空闲为高同样可见（脉冲分组里高电平占绝大多数）'],
-        ['Note 7② 点亮窗口内不得有 CLKa 活动', '最后一次 CLKa 上升沿必须早于 BK 下降沿',
-            `最后一次 CLKa 上升沿 → BK 下降沿（点亮开始）最小裕量 ${us(r.n72.margin.min)}`
-                + `（${r.n72.scans} 个扫描）；点亮窗口内 CLKa 上升沿 ${r.n72.litClka} 次`
+        ['Note 7② 数据写入期间 BK 不得变化', 'BK 跳变不得落在 CLKa 突发内部（与落点无关）',
+            `写入期间 BK 变化 ${r.n72.bkInWrite} 次（${r.n72.scans} 个扫描）`
+                + `；【参考量】末次 CLKa 上升沿 → BK 下降沿最小裕量 ${us(r.n72.margin.min)}`
+                + `、点亮窗口内 CLKa 上升沿 ${r.n72.litClka} 次`
                 + `；【参考量·不计判定】BK 跳变距最近 SIa 跳变 ≥ ${us(minBkToSia)}、落在 SIa 活动 1 µs 内 ${bkDuringData} 次`,
-            judge('note7-2', r.n72.scans > 0 && r.n72.litClka === 0 && num(r.n72.margin.min) && r.n72.margin.min >= 0,
-                `满足（${r.n72.scans} 个扫描的最后一次 CLKa 上升沿都早于 BK 下降沿，最小裕量 ${us(r.n72.margin.min)}）`,
+            judge('note7-2', r.n72.scans > 0 && r.n72.bkInWrite === 0,
+                `满足（${r.n72.scans} 个扫描的 BK 跳变都落在 CLKa 活动之外）`,
                 r.n72.scans === 0 ? '不可测（无 BK 下降沿样本）'
-                    : r.n72.litClka > 0
-                        ? `点亮窗口内出现 CLKa 上升沿 ${r.n72.litClka} 次（最小裕量 ${us(r.n72.margin.min)}，应为正）`
-                        : `最小裕量 ${us(r.n72.margin.min)} < 0`)],
+                    : `写入期间出现 BK 跳变 ${r.n72.bkInWrite} 次`)],
         ['Note 7③ CLK 低时不得变 BK', '不得在 CLK 低时变 BK',
             `BK 跳变时 CLKg 为低 ${bkWithClkLow} 次、CLKa 采样为低 ${bkClkaLow} 次（共 ${r.bkEdges.length} 次跳变）`,
             judge('note7-3', r.bkEdges.length > 0 && bkWithClkLow === 0 && bkClkaLow === 0,

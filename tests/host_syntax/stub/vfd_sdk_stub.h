@@ -145,6 +145,7 @@ uint pio_encode_jmp(uint addr);
 uint pio_encode_wait_gpio(bool polarity, uint gpio);
 uint pio_encode_wait_pin(bool polarity, uint pin);
 uint pio_encode_set(enum pio_src_dest dest, uint value);
+uint pio_encode_nop(void); /* SDK: pio_encode_mov(pio_y, pio_y) = 0xA042 */
 uint pio_encode_out(enum pio_src_dest dest, uint count);
 
 /* ------------------------------------------------------------ hardware/dma */
@@ -318,5 +319,10 @@ void uart_write_blocking(uart_inst_t *uart, const uint8_t *src, size_t len);
 void multicore_launch_core1(void (*entry)(void));
 /* 真实 SDK 里在 hardware/sync.h 定义（跨核内存屏障）；语法检查桩里退化为空 */
 static inline void __dmb(void) { }
+
+/* hardware/sync.h：中断保护（tick 引擎在挂起亮度变更时用它保护"值 + 标志"这一对写）。
+ * 签名照抄真实 SDK（返回 PRIMASK 旧值 / 恢复它）；这里只声明 —— 语法检查不链接。 */
+uint32_t save_and_disable_interrupts(void);
+void restore_interrupts(uint32_t status);
 
 #endif /* VFD_SDK_STUB_H */
