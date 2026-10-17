@@ -36,7 +36,9 @@ STM32F103 Arduino 驱动）**移植到 RP2040 / Raspberry Pi Pico（Pico SDK）*
   （手册 Figure 5 形态）、低亮度整段落在**消隐**窗口内；映射与边界只有 `src/vfd_pio_seed_timing.h` 一份，
   自洽性由编译期 `static_assert` 互锁
 * 自带**扫描心跳看护**：手册 Note 14 明确"栅极扫描停止可能永久损坏屏"，
-  停摆会自动恢复，连续失败则**停泊**（先关高压 + 关断灯丝驱动 + BK 全消隐 + 停扫描，板载 LED 常亮）
+  停摆会自动恢复，连续失败则**停泊**（先关高压 + 关断灯丝驱动 + BK 全消隐 + 停扫描，板载 LED 常亮）。
+  停泊的四项动作**已在实机确认**（2026-10-17：J-Link 读引脚实际电平 + 逻辑分析仪抓包 —— HVEN↓ 先于 FLEN↑、
+  BK 转恒高、`engineStop()` 后扫描停、且保持不恢复）
 * **SSD1306 行为模拟**：对端 MCU 用现成 SSD1306 库（Adafruit_SSD1306 / u8g2…）
   经 4 线 SPI 直接把画面发过来即可；支持显示/反显/全亮/对比度（→亮度）、页/水平/垂直寻址、
   **滚动（`0x26/0x27/0x29/0x2A` + `0x2E/0x2F`）**；**内置测试图像默认不渲染**，只有把
@@ -125,6 +127,12 @@ powershell -File tests\run_host_tests.ps1      # 需要 g++/clang++（6 个程�
 > **文档数字一致性门禁**：`run_host_tests.ps1` 跑完会自动执行 `tests/tools/check_doc_numbers.js`，
 > 把 pio 指令数（取自 `vfd_scan.pio.h`）、宿主测试项数（取自实测输出）、黄金样本清单与本仓库文档比对，
 > 不一致即失败 —— 防止 README / 报告 / CI 工作流里的数字与代码脱钩。
+>
+> **产物级核对（第三方无需嵌入式工具链）**：`tests/elf/` 里入库了三个构建（pio v1.4.0 / v1.5.0、
+> tick v1.5.1）的 `objdump`/`nm` 输出（`.txt.gz`/`.nm.gz`），于是
+> `node tests/tools/check_park_gpio.js`（fatal 停泊 + 状态 LED 的 SIO 写入路径/顺序）与
+> `node tests/tools/compare_elf_functions.js`（pio v1.4.0 → v1.5.0 行为中性对照：581/601 逐指令相同、
+> watch 清单全同）**只要 node 就能复跑**，两条都已接进 `run_host_tests.ps1` 第 ⑨ 步随 CI 执行。
 
 ### 2) RP2040 固件
 

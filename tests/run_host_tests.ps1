@@ -200,5 +200,19 @@ if ($node) {
     Write-Host "`n（未找到 node，跳过文档数字一致性门禁）" -ForegroundColor Yellow
 }
 
+# ---------------------------------------------------------------------------
+# ⑨ 产物级核对（吃入库的反汇编文本，纯 node，不需要 arm-none-eabi 工具链）
+#    · check_park_gpio.js：fatal 停泊/状态 LED 的 SIO 写入路径与顺序；
+#    · compare_elf_functions.js：pio v1.4.0 → v1.5.0 的"行为中性"对照（watch 清单逐指令相同）。
+#    两者都用 tests/elf/ 里入库的文本，第三方只有 node 也能复跑（见 tests/elf/README.md）。
+# ---------------------------------------------------------------------------
+if ($node) {
+    Write-Host "`n产物级核对（入库反汇编）：" -ForegroundColor Cyan
+    & node (Join-Path $PSScriptRoot 'tools/check_park_gpio.js')
+    if ($LASTEXITCODE -ne 0) { throw "停泊/LED 的 GPIO 写入核对失败（见上）" }
+    & node (Join-Path $PSScriptRoot 'tools/compare_elf_functions.js')
+    if ($LASTEXITCODE -ne 0) { throw "行为中性核对失败：watch 清单有差异（见上）" }
+}
+
 Write-Host "`n全部宿主机测试与语法检查通过" -ForegroundColor Green
 exit 0

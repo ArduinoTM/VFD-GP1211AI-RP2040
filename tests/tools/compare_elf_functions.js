@@ -8,6 +8,9 @@
  * 用法：
  *   node tests/tools/compare_elf_functions.js --a <elfA> --b <elfB> [--nm arm-none-eabi-nm]
  *        [--objdump arm-none-eabi-objdump] [--watch a,b,c] [--all]
+ *   node tests/tools/compare_elf_functions.js            # 无参数 = 用入库的"行为中性"对照对：
+ *        # tests/elf/pio-v1.4.0.{txt,nm}.gz → tests/elf/pio-v1.5.0.{txt,nm}.gz
+ *        # （**纯 node 可复跑**，不需要 arm-none-eabi 工具链；--a/--b 也可直接给 .txt/.txt.gz）
  *
  * 说明：
  *   · 工具默认从 PATH 找 arm-none-eabi-nm / arm-none-eabi-objdump（也可用 --nm/--objdump 指定全路径）；
@@ -25,14 +28,30 @@ function argVal(name, def) {
 }
 const hasFlag = (name) => process.argv.includes('--' + name);
 
-const elfA = argVal('a', null);
-const elfB = argVal('b', null);
-if (!elfA || !elfB) {
-    console.error('用法: node compare_elf_functions.js --a <elfA> --b <elfB> [--watch sym1,sym2] [--all]');
-    process.exit(2);
-}
 const NM = argVal('nm', 'arm-none-eabi-nm');
 const OBJDUMP = argVal('objdump', 'arm-none-eabi-objdump');
+const path = require('path');
+const fs = require('fs');
+
+/* 输入既可以是 ELF（需要工具链），也可以是入库的 objdump/nm 文本（纯 node，第三方可复跑）*/
+const isTextDump = (p) => /\.(txt|lst)(\.gz)?$/.test(p);
+function readAny(file) {
+    if (!fs.existsSync(file)) { console.error('找不到输入文件: ' + file); process.exit(2); }
+    const buf = fs.readFileSync(file);
+    return file.endsWith('.gz') ? require('zlib').gunzipSync(buf).toString('utf8') : buf.toString('utf8');
+}
+function defaultNmFor(p) { return p.replace(/\.(txt|lst)(\.gz)?$/, '.nm$2'); }
+
+let elfA = argVal('a', null);
+let elfB = argVal('b', null);
+if (!elfA || !elfB) {
+    const dir = path.join(__dirname, '..', 'elf');
+    elfA = path.join(dir, 'pio-v1.4.0.txt.gz');
+    elfB = path.join(dir, 'pio-v1.5.0.txt.gz');
+    console.log('（未给 --a/--b ⇒ 使用入库的 pio v1.4.0 → v1.5.0 反汇编对，不需要 arm-none-eabi 工具链）');
+}
+const nmA = argVal('a-nm', isTextDump(elfA) ? defaultNmFor(elfA) : elfA);
+const nmB = argVal('b-nm', isTextDump(elfB) ? defaultNmFor(elfB) : elfB);
 /* 默认"必须相同"的扫描/打包关键符号（子串匹配，避开 C++ mangling） */
 const DEFAULT_WATCH = [
     'scanTick', 'scanTimerThunk', 'vfdStrobe', 'vfdLatPulse', 'vfdSigHoldDelay',
@@ -43,7 +62,8 @@ const DEFAULT_WATCH = [
 const WATCH = argVal('watch', null) ? argVal('watch', null).split(',').map((s) => s.trim()).filter(Boolean) : DEFAULT_WATCH;
 
 function symbols(file) {
-    const out = execFileSync(NM, ['-S', '--defined-only', '--numeric-sort', file], { encoding: 'utf8', maxBuffer: 1 << 28 });
+    const out = isTextDump(file) ? readAny(file)
+        : execFileSync(NM, ['-S', '--defined-only', '--numeric-sort', file], { encoding: 'utf8', maxBuffer: 1 << 28 });
     const list = [];
     for (const line of out.split(/\r?\n/)) {
         const m = /^([0-9a-f]+)\s+([0-9a-f]+)\s+([tTwW])\s+(\S+)$/.exec(line.trim());
@@ -54,7 +74,8 @@ function symbols(file) {
 
 /* 把 objdump -d 的输出按 "<addr> <symbol>:" 切块 */
 function chunks(file) {
-    const text = execFileSync(OBJDUMP, ['-d', '--no-show-raw-insn', file], { encoding: 'utf8', maxBuffer: 1 << 28 });
+    const text = isTextDump(file) ? readAny(file)
+        : execFileSync(OBJDUMP, ['-d', '--no-show-raw-insn', file], { encoding: 'utf8', maxBuffer: 1 << 28 });
     const map = new Map();
     let cur = null;
     for (const line of text.split(/\r?\n/)) {

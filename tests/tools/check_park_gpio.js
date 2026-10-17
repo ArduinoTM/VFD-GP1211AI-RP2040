@@ -6,9 +6,14 @@
  * 碰不到真正的 RP2040 实现；若不方便上机（人为制造扫描停摆），可以用本脚本在产物级核对：
  * 反汇编里必须能看到对应的 SIO 寄存器写。
  *
- * 用法：
+ * 用法（两种，**第三方只有 node 也能复跑第二种**）：
  *   node tests/tools/check_park_gpio.js <elf> [--objdump arm-none-eabi-objdump]
- *   （工具默认从 PATH 找 arm-none-eabi-objdump）
+ *     （工具默认从 PATH 找 arm-none-eabi-objdump）
+ *   node tests/tools/check_park_gpio.js <dump.txt[.gz]>            # 吃入库的反汇编文本
+ *   node tests/tools/check_park_gpio.js                            # 不给参数 = 用入库的
+ *                                                                  # tests/elf/tick-v1.5.1.txt.gz
+ *   反汇编文本用以下命令生成（压缩后入库，见 tests/elf/README.md）：
+ *     arm-none-eabi-objdump -d --no-show-raw-insn <elf> | gzip > tests/elf/tick-<版本>.txt.gz
  *
  * RP2040 SIO @ 0xd0000000：GPIO_OUT_SET = +0x14(#20)、GPIO_OUT_CLR = +0x18(#24)、GPIO_OE_SET = +0x24(#36)
  *
@@ -32,10 +37,24 @@ function argVal(name, def) {
     return i > 0 && process.argv[i + 1] ? process.argv[i + 1] : def;
 }
 const elf = process.argv.slice(2).find((a) => !a.startsWith('--') && !/objdump/.test(a));
-if (!elf) { console.error('用法: node check_park_gpio.js <elf> [--objdump <path>]'); process.exit(2); }
 const OBJDUMP = argVal('objdump', 'arm-none-eabi-objdump');
 
-const dump = execFileSync(OBJDUMP, ['-d', '--no-show-raw-insn', elf], { encoding: 'utf8', maxBuffer: 1 << 28 });
+/* 输入可以是 ELF（需要工具链），也可以是入库的 objdump 文本（纯 node，第三方可复跑）*/
+function loadDump(target) {
+    const fs = require('fs');
+    const path = require('path');
+    let file = target;
+    if (!file) {
+        file = path.join(__dirname, '..', 'elf', 'tick-v1.5.1.txt.gz');
+        console.log('（未给参数 ⇒ 使用入库反汇编 ' + path.relative(process.cwd(), file) + '，不需要 arm-none-eabi 工具链）');
+    }
+    if (!fs.existsSync(file)) { console.error('找不到输入文件: ' + file); process.exit(2); }
+    const buf = fs.readFileSync(file);
+    if (file.endsWith('.gz')) return require('zlib').gunzipSync(buf).toString('utf8');
+    if (/\.(txt|lst)$/.test(file)) return buf.toString('utf8');
+    return execFileSync(OBJDUMP, ['-d', '--no-show-raw-insn', file], { encoding: 'utf8', maxBuffer: 1 << 28 });
+}
+const dump = loadDump(elf);
 const chunks = new Map();
 let cur = null;
 for (const line of dump.split(/\r?\n/)) {
