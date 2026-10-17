@@ -22,6 +22,7 @@
  *   E  vfd::Platform::setStatusLed()：空实现（bx lr）⇒ 平台不实现时是 no-op。
  *
  * ⚠️ 本脚本证明的是"路径存在、寄存器与顺序正确"，**不能替代真机电平测量**（脚号是运行时值）。
+ * ✅ 2026-10-17 已在实机补做真机电平测量（J-Link 读引脚 + LA 抓包，见 docs/08 §7）。
  */
 'use strict';
 const { execFileSync } = require('child_process');
