@@ -126,10 +126,11 @@ powershell -File tests\run_host_tests.ps1      # 需要 g++/clang++（6 个程�
 
 > **文档数字一致性门禁**：`run_host_tests.ps1` 跑完会自动执行 `tests/tools/check_doc_numbers.js`，
 > 把 pio 指令数（取自 `vfd_scan.pio.h`）、宿主测试项数（取自实测输出）、黄金样本清单与本仓库文档比对，
-> 不一致即失败 —— 防止 README / 报告 / CI 工作流里的数字与代码脱钩。
+> 不一致即失败 —— 防止 README / 报告 / CI 工作流里的数字与代码脱钩。门禁自带 `--selftest` 回归用例
+> （含「带日期的错误数字」这类假阴性场景），随宿主测试一起跑。
 >
 > **产物级核对（第三方无需嵌入式工具链）**：`tests/elf/` 里入库了三个构建（pio v1.4.0 / v1.5.0、
-> tick v1.5.1）的 `objdump`/`nm` 输出（`.txt.gz`/`.nm.gz`），于是
+> tick v1.5.2）的 `objdump`/`nm` 输出（`.txt.gz`/`.nm.gz`），于是
 > `node tests/tools/check_park_gpio.js`（fatal 停泊 + 状态 LED 的 SIO 写入路径/顺序）与
 > `node tests/tools/compare_elf_functions.js`（pio v1.4.0 → v1.5.0 行为中性对照：581/601 逐指令相同、
 > watch 清单全同）**只要 node 就能复跑**，两条都已接进 `run_host_tests.ps1` 第 ⑨ 步随 CI 执行。

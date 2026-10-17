@@ -16,6 +16,7 @@
  *   node tests/tools/check_doc_numbers.js
  *   node tests/tools/check_doc_numbers.js --host-parts 79,122,46,53,43 --host-total 343 --handshake-total 79102
  *   node tests/tools/check_doc_numbers.js -v        # 顺带打印每个被检查到的数字
+ *   node tests/tools/check_doc_numbers.js --selftest # 只跑判定逻辑的回归用例（G1 假阴性防护）
  */
 'use strict';
 const fs = require('fs');
@@ -32,6 +33,7 @@ for (let i = 0; i < args.length; ++i) {
   else if (a === '--host-parts') opt.hostParts = args[++i].split(',').map(Number);
   else if (a === '--host-total') opt.hostTotal = Number(args[++i]);
   else if (a === '--handshake-total') opt.handshakeTotal = Number(args[++i]);
+  else if (a === '--selftest') opt.selftest = true;
   else { console.error('未知参数: ' + a); process.exit(2); }
 }
 
@@ -66,38 +68,69 @@ const files = [];
   }
 })(root);
 
-/* 历史口径豁免：这些行是在讲"以前是多少"，不要求等于当前值 */
-const HIST = /(旧版|此前|曾经|原版|当年|当时|历史|20\d\d-\d\d-\d\d)/;
+/* 历史口径豁免：这些行是在讲"以前是多少"，不要求等于当前值。
+ * ⚠️ 2026-10-17 评审 G1（假阴性）：**日期不能单独**作为豁免条件 —— 本仓库文档几乎每段都带日期，
+ *    若 `20\d\d-\d\d-\d\d` 单独触发豁免，"现行 27/32 条（2026-10-17 复核）"这类**带日期的错误数字**
+ *    会被放过（实测 EXIT=0）。现要求必须出现"旧版/此前/当时/历史"等措辞才算历史口径。
+ *    回归用例：`node tests/tools/check_doc_numbers.js --selftest`（已接入 run_host_tests.ps1）。 */
+const HIST = /(旧版|此前|曾经|原版|当年|当时|历史)/;
 
 /* "当前口径"文档白名单：只有这些文件里的测试项数代表"现在"（其余如 docs/07 提交历史、
  * docs/11/16 会话提示词快照、各专项排故报告里的项数是当时的值，属历史记录，不参与比对；
  * pio 指令数与黄金样本清单仍全仓库检查）。 */
 const CURRENT_DOCS = /^(README\.md|docs\/(00|08|15)-.*\.(md|html)|\.github\/workflows\/.*\.yml|tests\/captures\/README\.md)$/;
 
-/* ---- 3. 检查：pio 指令数 "N/32" -------------------------------------------- */
+/* ---- 3. 检查：pio 指令数（"N/32" 与 "现行 N 条" 两种写法）------------------- */
+/* 判定抽成纯函数：文档扫描与 --selftest 共用同一套逻辑（防止两处分叉）。 */
+function checkPioInsnText(text) {
+  const out = [];
+  /* "扫描/程序/现行 ... N/32"、"程序占 N/32" */
+  const re = /(?:扫描|程序|现行)\s*(?:占)?\s*[:：]?\s*\**\s*(\d+)\s*\**\s*\/\s*32/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const n = parseInt(m[1], 10);
+    if (n === pioTotal) continue; /* "32/32 满额" 这类讲满额的不算 */
+    const ctx = text.slice(Math.max(0, m.index - 14), m.index);
+    if (/从机|slave|SSD1306/i.test(ctx)) continue; /* 从机程序是另一个程序，不在本检查范围 */
+    if (HIST.test(text)) continue; /* 历史口径：豁免（日期不单独豁免，见 HIST 注释）*/
+    if (n !== pioInsns)
+      out.push('pio 程序指令数写 ' + n + '/32，实际 ' + pioInsns + '/32（取自 src/vfd_scan.pio.h 的 vfd_scan_wrap + 1）');
+  }
+  /* "现行 N 条"（不带 /32 的写法）—— 与上面的分支**同一套豁免口径**（G1 的次要问题：两分支曾不一致）*/
+  const re2 = /现行\s*\**\s*(\d+)\s*\**\s*条/g;
+  while ((m = re2.exec(text)) !== null) {
+    const n = parseInt(m[1], 10);
+    if (HIST.test(text)) continue;
+    if (n !== pioInsns) out.push('pio 程序指令数写"现行 ' + n + ' 条"，实际 ' + pioInsns + ' 条');
+  }
+  return out;
+}
+
+/* --selftest：判定逻辑的回归用例（G1 假阴性防护，评审报告给出的两个对抗注入场景）。
+ * 用例是**合成文本**，不依赖仓库当前内容，所以文档改了也不会失效。 */
+if (opt.selftest) {
+  const cases = [
+    ['现行 ' + (pioInsns + 1) + '/32 条。', 1, '无日期的错误数字必须抓'],
+    ['现行 ' + (pioInsns + 1) + '/32 条（2026-10-17 复核）。', 1, 'G1 回归：带日期的错误数字也必须抓'],
+    ['现行 ' + (pioInsns + 1) + ' 条（2026-10-17 复核）。', 1, 're2 分支与 N/32 分支口径必须一致'],
+    ['旧版本的程序占 ' + (pioInsns + 1) + '/32 条（2026-10-08 起）。', 0, '有历史措辞：豁免'],
+    ['当时的现行 ' + (pioInsns + 1) + ' 条，后来改成 ' + pioInsns + ' 条。', 0, 're2 + 历史措辞：豁免'],
+    ['现行 ' + pioInsns + '/32 条（2026-10-17 复核）。', 0, '正确数字：放行'],
+  ];
+  let bad = 0;
+  for (const [text, want, why] of cases) {
+    const got = checkPioInsnText(text).length;
+    if (got !== want) { console.log("  ❌ 期望 " + want + " 处违规、实得 " + got + " 处：" + why + " —— " + JSON.stringify(text)); bad++; }
+    else if (opt.verbose) console.log("  ✅ " + why);
+  }
+  console.log(bad ? ("selftest: " + bad + " 项失败 ⇒ 退出码 1") : "selftest: " + cases.length + " 个用例全部通过 ⇒ 退出码 0");
+  process.exit(bad ? 1 : 0);
+}
+
 for (const rel of files) {
   const lines = fs.readFileSync(path.join(root, rel), 'utf8').split(/\r?\n/);
   lines.forEach((text, idx) => {
-    const lineNo = idx + 1;
-    /* "扫描/程序/现行 ... N/32"、"程序占 N/32" */
-    const re = /(?:扫描|程序|现行)\s*(?:占)?\s*[:：]?\s*\**\s*(\d+)\s*\**\s*\/\s*32/g;
-    let m;
-    while ((m = re.exec(text)) !== null) {
-      const n = parseInt(m[1], 10);
-      if (n === pioTotal) continue; /* "32/32 满额" 这类讲满额的不算 */
-      const ctx = text.slice(Math.max(0, m.index - 14), m.index);
-      if (/从机|slave|SSD1306/i.test(ctx)) continue; /* 从机程序是另一个程序，不在本检查范围 */
-      if (HIST.test(text)) { if (opt.verbose) notices.push(rel + ':' + lineNo + ': 历史口径 ' + n + '/32（豁免）'); continue; }
-      if (n !== pioInsns)
-        fail(rel, lineNo, 'pio 程序指令数写 ' + n + '/32，实际 ' + pioInsns + '/32（取自 src/vfd_scan.pio.h 的 vfd_scan_wrap + 1）');
-      else if (opt.verbose) notices.push(rel + ':' + lineNo + ': ' + n + '/32 ✓');
-    }
-    /* "现行 N 条"（不带 /32 的写法） */
-    const re2 = /现行\s*\**\s*(\d+)\s*\**\s*条/g;
-    while ((m = re2.exec(text)) !== null) {
-      const n = parseInt(m[1], 10);
-      if (n !== pioInsns) fail(rel, lineNo, 'pio 程序指令数写"现行 ' + n + ' 条"，实际 ' + pioInsns + ' 条');
-    }
+    for (const msg of checkPioInsnText(text)) fail(rel, idx + 1, msg);
   });
 }
 

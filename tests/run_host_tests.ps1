@@ -193,7 +193,9 @@ if ($node) {
     $gateArgs = @((Join-Path $PSScriptRoot 'tools/check_doc_numbers.js'))
     if ($parts.Count -eq 5) { $gateArgs += @('--host-parts', ($parts -join ','), '--host-total', "$hostTotal") }
     if ($handshake -gt 0) { $gateArgs += @('--handshake-total', "$handshake") }
-    Write-Host "`n文档数字一致性门禁:" -ForegroundColor Cyan
+    Write-Host "`n文档数字一致性门禁（先跑 selftest 回归用例，再扫全仓）:" -ForegroundColor Cyan
+    & node (Join-Path $PSScriptRoot 'tools/check_doc_numbers.js') --selftest
+    if ($LASTEXITCODE -ne 0) { throw "文档数字门禁的 selftest 失败（G1 假阴性防护用例，见 check_doc_numbers.js）" }
     & node @gateArgs
     if ($LASTEXITCODE -ne 0) { throw "文档数字一致性门禁失败：文档里的数字与代码事实不一致（见上）" }
 } else {
