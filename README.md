@@ -133,6 +133,9 @@ powershell -File tests\run_host_tests.ps1      # 需要 g++/clang++（6 个程�
 > `node tests/tools/check_park_gpio.js`（fatal 停泊 + 状态 LED 的 SIO 写入路径/顺序）与
 > `node tests/tools/compare_elf_functions.js`（pio v1.4.0 → v1.5.0 行为中性对照：581/601 逐指令相同、
 > watch 清单全同）**只要 node 就能复跑**，两条都已接进 `run_host_tests.ps1` 第 ⑨ 步随 CI 执行。
+>
+> **上机验证（HIL）**：`tests/hil/` 归档了 **fatal 停泊**的上机验证流程与脚本 —— 两种"只写寄存器"的真实故障注入
+> （pio 关 DMA 中断 / tick 关定时器中断）+ J-Link 读回判据 + LA 抓包分析脚本（纯 node），需 J-Link 与**未接面板**的测试板。
 
 ### 2) RP2040 固件
 

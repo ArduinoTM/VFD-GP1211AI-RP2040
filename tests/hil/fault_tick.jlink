@@ -1,0 +1,29 @@
+; fault_tick.jlink —— tick 引擎的「真实故障注入」：只写一个寄存器关 TIMER_IRQ_3（扫描定时器中断）
+;
+; 原理：tick 引擎的扫描进度由 repeating_timer（默认 alarm pool → TIMER_IRQ_3）推进 ⇒ 屏蔽 IRQ 3 后
+;       _scans 冻结 ⇒ 看护连续判停 4 次、recover() 重装定时器也恢复不了（NVIC 掩码不会被清）⇒
+;       固件自己走 emergencyOff() 停泊 ⇒ _fatal=1 ⇒ LED 常亮。
+;
+; ⚠️ 已知健壮性点（HIL 发现，未改代码）：emergencyOff() 里"关高压→关灯丝驱动"之后的 sleep_ms(10)
+;    依赖定时器中断；定时器类故障下安全三动作（HVEN/FLEN/BK）立即生效，但 engineStop()/_fatal/LED
+;    要等下一个中断事件。下面的 halt/resume 循环就是人工制造 WFE 唤醒事件，让停泊流程走完。
+; 判据：GPIO_IN 的 GP8=0、GP9=1；SIO_OUT bit25=1；_fatal=1。
+; 前置：板子已烧 tick 构建并启动完毕（等 ≥2.5 s）。
+h
+Mem 0xd0000004, 4
+Mem 0x40054038, 1
+W4 0xE000E180, 0x8
+g
+Sleep 1500
+; 唤醒 WFE，让 emergencyOff() 的 sleep_ms(10) 结束（两次 halt/resume 足够）
+h
+g
+Sleep 200
+h
+g
+Sleep 200
+h
+Mem 0xd0000004, 4
+Mem 0xd0000010, 4
+Mem 0x2000B24C, 1
+q

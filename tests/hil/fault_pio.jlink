@@ -1,0 +1,21 @@
+; fault_pio.jlink —— pio 引擎的「真实故障注入」：只写一个寄存器关 DMA_IRQ_0
+;
+; 原理：pio 引擎的扫描进度由 onFrameDmaDone（DMA_IRQ_0）推进 ⇒ 屏蔽 IRQ 11 后 _scans 冻结
+;       ⇒ 驱动层看护连续判停 4 次、recover() 重初始化也清不掉 NVIC 掩码 ⇒ 固件自己走
+;       emergencyOff() 停泊（关高压/关灯丝驱动/BK 全消隐/停扫描）⇒ _fatal=1 ⇒ 板载 LED 常亮。
+; 判据（下文两次 Mem 的对比）：
+;   · GPIO_IN(0xd0000004)：注入前 HV_EN(GP8)=1、FL_EN(GP9)=0；停泊后 HV_EN=0、FL_EN=1；
+;   · SIO_OUT(0xd0000010) bit25 = 1 ⇒ LED 常亮（GP25 是 SIO 输出）；
+;   · _fatal（gDisplay + 0x1460，随构建而变，见 tests/hil/README.md 的取址方法）= 1。
+; 前置：板子已烧 pio 构建并启动完毕（等 ≥2.5 s，避开上电时序的 HVEN↓ 干扰）。
+h
+Mem 0xd0000004, 4
+Mem 0x40014014, 1
+W4 0xE000E180, 0x800
+g
+Sleep 2500
+h
+Mem 0xd0000004, 4
+Mem 0xd0000010, 4
+Mem 0x2000A17C, 1
+q

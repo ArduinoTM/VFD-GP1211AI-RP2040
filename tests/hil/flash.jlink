@@ -1,0 +1,10 @@
+; flash.jlink —— 把 build-rp2040*/vfd_gp1211ai_demo.elf 烧进板子（J-Link，RP2040）
+; 用法（在仓库根目录）：
+;   "C:\Program Files\SEGGER\JLink_V848\JLink.exe" -Device RP2040_M0_0 -If SWD -Speed 4000 \
+;       -autoconnect 1 -ExitOnError 1 -CommanderScript tests\hil\flash.jlink
+; ⚠️ loadfile 用的是从仓库根目录出发的相对路径；ELF 默认为 tick 单核构建，换引擎/配置时改这一行。
+h
+loadfile build-rp2040/vfd_gp1211ai_demo.elf
+r
+g
+q
