@@ -22,7 +22,16 @@ const file = process.argv[2];
 if (!file) { console.error('用法: node tests/hil/analyze_fault_capture.js <抓包.csv>'); process.exit(2); }
 const SIG = ['CLKa','SIa','LAT','CLKg','SIg','BK','HVEN','FLEN'];
 const rows = [];
-const rl = readline.createInterface({ input: fs.createReadStream(file), crlfDelay: Infinity });
+/* 输入可以是 .csv，也可以是 .csv.gz（抓包体积大，归档时压缩；纯 node 解压）*/
+let input;
+if (/\.gz$/.test(file)) {
+    const { PassThrough } = require('stream');
+    input = new PassThrough();
+    input.end(require('zlib').gunzipSync(fs.readFileSync(file)));
+} else {
+    input = fs.createReadStream(file);
+}
+const rl = readline.createInterface({ input, crlfDelay: Infinity });
 let hdr = null;
 rl.on('line', (line) => {
   if (!line) return;

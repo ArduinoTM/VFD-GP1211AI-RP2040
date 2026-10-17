@@ -32,7 +32,7 @@
 "<JLink.exe>" -Device RP2040_M0_0 -If SWD -Speed 4000 -autoconnect 1 -CommanderScript tests/hil/fault_pio.jlink
 "<JLink.exe>" -Device RP2040_M0_0 -If SWD -Speed 4000 -autoconnect 1 -CommanderScript tests/hil/fault_tick.jlink
 # 5) 导出的 LA 抓包用纯 node 分析（不需要工具链）
-node tests/hil/analyze_fault_capture.js <抓包.csv>
+node tests/hil/analyze_fault_capture.js <抓包.csv[.gz]>
 # 6) 复位回正常态
 "<JLink.exe>" -Device RP2040_M0_0 -If SWD -Speed 4000 -autoconnect 1 -CommanderScript tests/hil/reset.jlink
 ```
