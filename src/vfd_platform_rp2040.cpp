@@ -321,7 +321,19 @@ void Rp2040Platform::emergencyOff()
     gpio_put(_cfg.pin_fl_en, 1);
     rp2040ApplyPwmLevel(_pwmSlice, _pwmChannel, _pwmWrap, 0);
     _litWindowUs = 0;
-    sleep_ms(10);
+    /* "先关高压、再停扫描"之间留 PARK_SETTLE_US 让 VDD2 泄放。
+     * ⚠️ 这里**不能用 sleep_ms()**（v1.5.2 健壮性修复，HIL 抓出来的）：sleep 依赖定时器中断
+     *    （默认 alarm pool → TIMER_IRQ_3），而本函数要处理的故障之一恰恰可能是"定时器中断失效"；
+     *    那样流程会挂在这句 sleep 上，engineStop() / _fatal / LED 常亮都走不到（安全三动作已生效，
+     *    但状态与指示不完整）。⇒ 改为**直接读硬件计时器的忙等**，不依赖任何中断：
+     *    timer_hw->timerawl 是 RP2040 TIMER 的自由运行微秒计数，与 alarm/中断无关；
+     *    32 位差值比较天然处理回绕（PARK_SETTLE_US = 10 ms « 71 min）。 */
+    {
+        const uint32_t parkT0 = timer_hw->timerawl;
+        while (static_cast<uint32_t>(timer_hw->timerawl - parkT0) < PARK_SETTLE_US) {
+            tight_loop_contents();
+        }
+    }
     engineStop();
 }
 

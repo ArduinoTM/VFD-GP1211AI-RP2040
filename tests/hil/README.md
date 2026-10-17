@@ -56,9 +56,9 @@ node tests/hil/analyze_fault_capture.js <抓包.csv>
 1. **LA 触发被上电时序抢走**：脚本开头的 `reset` 之后，上电时序第①步也是 `HVEN=0` ⇒ 触发落在开机、
    抓到的 `FLEN` 脉冲（+4 ms 起到 +25 ms 落）是**灯丝驱动自检脉冲**、"扫描恢复"是预热结束。
    ⇒ 测试前先让板子启动完成，再布防，且**注入脚本里不要 reset**。
-2. **tick 定时器类故障下停泊会卡在 `sleep_ms(10)`**：`emergencyOff()` 的这句延时依赖定时器中断。
+2. **tick 定时器类故障下停泊会卡在 `sleep_ms(10)`**（**v1.5.2 已修复**：改成直接读硬件计时器的忙等，不再依赖定时器中断；以下是旧版本的现象记录）：`emergencyOff()` 的这句延时依赖定时器中断。
    安全三动作（HVEN/FLEN/BK）已立即生效，但 `engineStop()/_fatal/LED` 要等下一个中断事件 ⇒
-   `fault_tick.jlink` 里用两次 halt/resume 制造 WFE 唤醒让它走完（**待定改进**：把该延时改成忙等，需发 v1.5.2）。
+   `fault_tick.jlink` 里用两次 halt/resume 制造 WFE 唤醒让它走完（v1.5.2 起不需要了）。
 
 ## 实测记录（2026-10-17）
 

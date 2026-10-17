@@ -11,7 +11,7 @@
  *     （工具默认从 PATH 找 arm-none-eabi-objdump）
  *   node tests/tools/check_park_gpio.js <dump.txt[.gz]>            # 吃入库的反汇编文本
  *   node tests/tools/check_park_gpio.js                            # 不给参数 = 用入库的
- *                                                                  # tests/elf/tick-v1.5.1.txt.gz
+ *                                                                  # tests/elf/tick-v1.5.2.txt.gz
  *   反汇编文本用以下命令生成（压缩后入库，见 tests/elf/README.md）：
  *     arm-none-eabi-objdump -d --no-show-raw-insn <elf> | gzip > tests/elf/tick-<版本>.txt.gz
  *
@@ -24,6 +24,8 @@
  *   C  Rp2040Platform::setStatusLed()：on/off 两个分支分别写 #20/#24，且 **LED 位 = 1 << VFD_PIN_LED**
  *      确实被算出来（LED 脚号是编译期常量，不进 Rp2040Config —— 见 vfd_platform_rp2040.h 注释）；
  *   D  Rp2040Platform::init()：写 GPIO_OE_SET(#36) ⇒ LED 被配成输出；
+ *   F  Rp2040Platform::emergencyOff()（v1.5.2 健壮性修复）：等待必须**不依赖定时器中断** ——
+ *      不得调用 sleep_ms()，须直接读硬件计时器（TIMER 基址 0x40054000 / TIMERAWL 0x40054028）忙等；
  *   E  vfd::Platform::setStatusLed()：空实现（bx lr）⇒ 平台不实现时是 no-op。
  *
  * ⚠️ 本脚本证明的是"路径存在、寄存器与顺序正确"，**不能替代真机电平测量**（脚号是运行时值）。
@@ -45,7 +47,7 @@ function loadDump(target) {
     const path = require('path');
     let file = target;
     if (!file) {
-        file = path.join(__dirname, '..', 'elf', 'tick-v1.5.1.txt.gz');
+        file = path.join(__dirname, '..', 'elf', 'tick-v1.5.2.txt.gz');
         console.log('（未给参数 ⇒ 使用入库反汇编 ' + path.relative(process.cwd(), file) + '，不需要 arm-none-eabi 工具链）');
     }
     if (!fs.existsSync(file)) { console.error('找不到输入文件: ' + file); process.exit(2); }
@@ -134,6 +136,18 @@ function ledMaskBuilt(lines, pin) {
     judge('E vfd::Platform::setStatusLed 默认 no-op', empty,
         empty ? '空实现（bx lr）⇒ 平台未实现 LED 时调用无副作用' : '不是空实现（或找不到符号）',
         c ? c.lines.join(' | ') : '(找不到符号)');
+}
+
+/* F（v1.5.2 健壮性修复）：fatal 停泊的等待**不依赖定时器中断** ——
+ *    不得调用 sleep_ms()（它依赖默认 alarm pool → TIMER_IRQ_3），必须直接读硬件计时器忙等。 */
+{
+    const c = pick('Rp2040Platform12emergencyOffEv');
+    const hasSleep = c ? c.lines.some((l) => /sleep_ms/.test(l)) : true;
+    const hasTimer = c ? c.lines.some((l) => /400540(00|28)/.test(l)) : false;
+    judge('F emergencyOff 等待不依赖定时器中断（v1.5.2）', !!c && !hasSleep && hasTimer,
+        hasSleep ? '仍调用 sleep_ms：定时器中断失效时停泊会挂在这一句'
+            : (hasTimer ? '无 sleep_ms 调用，直接读 TIMER/TIMERAWL 忙等' : '未看到 TIMER 基址，忙等实现可能被改动'),
+        c ? c.lines.filter((l) => /400540|sleep/.test(l)).slice(0, 2).join(' | ') : '(找不到 emergencyOff)');
 }
 console.log(fail ? ('\n结论：' + fail + ' 项不满足 ⇒ 退出码 1') : '\n结论：全部通过 ⇒ 退出码 0');
 process.exit(fail ? 1 : 0);

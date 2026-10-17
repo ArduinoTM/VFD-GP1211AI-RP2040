@@ -8,12 +8,12 @@
 |---|---|---|
 | `pio-v1.4.0.txt.gz` / `.nm.gz` | 发布 **v1.4.0**（`5fe858e`）的 pio 单核构建 | 行为中性对照的 **A 侧** |
 | `pio-v1.5.0.txt.gz` / `.nm.gz` | 发布 **v1.5.0**（`89ad18a`）的 pio 单核构建 | 对照的 **B 侧** |
-| `tick-v1.5.1.txt.gz` / `.nm.gz` | 发布 **v1.5.1** 的 tick 单核构建 | 停泊/LED 的 GPIO 写入核对 |
+| `tick-v1.5.2.txt.gz` / `.nm.gz` | 发布 **v1.5.2** 的 tick 单核构建 | 停泊/LED 的 GPIO 写入核对（含 v1.5.2 的 F 判据：停泊等待不依赖定时器中断）|
 
 ## 复跑（不需要任何嵌入式工具链）
 
 ```bash
-node tests/tools/check_park_gpio.js            # 用 tick-v1.5.1.txt.gz，退出码 0 = 全部判据通过
+node tests/tools/check_park_gpio.js            # 用 tick-v1.5.2.txt.gz，退出码 0 = 全部判据（A–F）通过
 node tests/tools/compare_elf_functions.js      # 用 pio v1.4.0 → v1.5.0 对照对，退出码 0 = watch 清单逐指令相同
 ```
 

@@ -4,9 +4,10 @@
 ;       _scans 冻结 ⇒ 看护连续判停 4 次、recover() 重装定时器也恢复不了（NVIC 掩码不会被清）⇒
 ;       固件自己走 emergencyOff() 停泊 ⇒ _fatal=1 ⇒ LED 常亮。
 ;
-; ⚠️ 已知健壮性点（HIL 发现，未改代码）：emergencyOff() 里"关高压→关灯丝驱动"之后的 sleep_ms(10)
+; ✅ v1.5.2 已修：emergencyOff() 的等待改成直接读硬件计时器的忙等，不再依赖定时器中断。
+; 旧版本（v1.5.1 及以前）已知健壮性点：emergencyOff() 里"关高压→关灯丝驱动"之后的 sleep_ms(10)
 ;    依赖定时器中断；定时器类故障下安全三动作（HVEN/FLEN/BK）立即生效，但 engineStop()/_fatal/LED
-;    要等下一个中断事件。下面的 halt/resume 循环就是人工制造 WFE 唤醒事件，让停泊流程走完。
+;    要等下一个中断事件。下面保留 halt/resume 循环只是兼容旧固件，v1.5.2 起不需要。
 ; 判据：GPIO_IN 的 GP8=0、GP9=1；SIO_OUT bit25=1；_fatal=1。
 ; 前置：板子已烧 tick 构建并启动完毕（等 ≥2.5 s）。
 h

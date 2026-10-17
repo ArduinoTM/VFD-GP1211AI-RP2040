@@ -31,6 +31,12 @@ constexpr int SCAN_PERIOD_US = 189;
  * 实际消隐 = SCAN_PERIOD_US − 点亮窗口；点亮窗口由亮度决定（全亮时 = 89 µs）。 */
 constexpr int BLANK_GUARD_US = 100;
 
+/* fatal 停泊时"关高压 → 停扫描"之间等待 VDD2 泄放的时间，µs。
+ * ⚠️ 这段等待**不能用 sleep_ms()**（它依赖定时器中断；而停泊要处理的故障之一可能就是定时器中断失效）。
+ * 实现见 Rp2040Platform::emergencyOff()：直接读硬件计时器 timer_hw->timerawl 的忙等，不依赖任何中断。
+ * 取值沿用 B 类整改时定的 10 ms（手册要求"先关高压、再停扫描"）。 */
+constexpr uint32_t PARK_SETTLE_US = 10000;
+
 /* 面板几何：一帧 = 43 个时序（手册第 5 页扫描顺序 T43,T1,…,T42）；
  * 每个时序 384 bit = 48 字节阳极数据。 */
 constexpr int SCANS_PER_FRAME = 43;
