@@ -17,7 +17,8 @@
 | 方式 | 注入 | 走到的结果 | 备注 |
 |---|---|---|---|
 | **pio 引擎 · 关 DMA 中断** | `NVIC_ICER0 = bit11`（DMA_IRQ_0）| 扫描帧进度冻结 → 看护 4 次判停 → recover 无效 → fatal 停泊 | `fault_pio.jlink`；一次成功，LED 常亮 |
-| **tick 引擎 · 关定时器中断** | `NVIC_ICER0 = bit3`（TIMER_IRQ_3）| 扫描停摆 → 看护 4 次判停 → recover 无效 → fatal 停泊 | `fault_tick.jlink`；安全三动作立即生效，`engineStop()/_fatal/LED` 需一次 WFE 唤醒（脚本里用 halt/resume 制造） |
+| **tick 引擎 · 关定时器中断** | `NVIC_ICER0 = bit3`（TIMER_IRQ_3）| 扫描停摆 → 看护 4 次判停 → recover 无效 → fatal 停泊 | `fault_tick.jlink`；v1.5.2 起停泊一次走完（旧版需一次 WFE 唤醒，脚本里的 halt/resume 现只为兼容旧固件）|
+| **pio 引擎 · 关 DMA 中断 + 定时器中断都失效** | `NVIC_ICER0 = 0x808`（bit11 + bit3）| 扫描停摆 + 定时器死 ⇒ 看护 4 次判停 → fatal 停泊一次走完 | v1.5.2 复验：HV_EN=0 / FL_EN=1 / `PIO0_CTRL=0` / `_fatal=1` / LED 常亮 |
 | tick 引擎 · 直调 `emergencyOff()`（早期验证，已不推荐）| 用调试器改 PC 调用真实函数 | 停泊动作 + 电平实测 | 验证过但**不能证明看护链路**，脚本已删除 |
 
 ## 步骤
@@ -64,6 +65,7 @@ node tests/hil/analyze_fault_capture.js <抓包.csv>
 
 * pio：`NVIC_ICER0=bit11` ⇒ 3 s 后 HV_EN=0 / FL_EN=1 / `PIO0_CTRL=0` / `_fatal=1` / **LED 常亮**；
 * tick：`NVIC_ICER0=bit3` ⇒ +0.5 s HV_EN=0/FL_EN=1、+1.2 s `_fatal=1`+LED 常亮、+3 s 保持；
+* **v1.5.2 复验（两引擎、含定时器失效）**：tick 关 TIMER_IRQ_3、pio 同时关 DMA_IRQ_0+TIMER_IRQ_3 ⇒ 均**不做唤醒**即一次走完停泊（+1.5~2.5 s 读回 HV_EN=0/FL_EN=1/`_fatal=1`/LED 常亮）；
 * LA 抓包（有效样本）：`Fault-PIO-dma-irq.csv`、`Fault-Tick-timer-irq.csv`
   —— HVEN↓ → FLEN↑（+0.4 µs，单次保持）→ BK 恒高；扫描在触发前（判停窗口）已停。
 * 详细记录：开发仓库 `docs/08` §7、`docs/07`（B1）；LA 抓包本身不入库（单份 1.5–2.3 MB），需要时向维护者索取。
