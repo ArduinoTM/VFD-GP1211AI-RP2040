@@ -35,6 +35,9 @@ $stubInc = @(
 )
 $warnArgs = @('-std=c++17', '-O1', '-Wall', '-Wextra', '-Wno-unused-parameter')
 
+# 各项测试的总数（Build-And-Run 里填），供文件末尾的文档数字一致性门禁使用
+$script:testTotals = @{}
+
 function Build-And-Run([string]$name, [string[]]$sources, [string[]]$includes = $null) {
     $exe = Join-Path $outDir "$name.exe"
     $inc = $commonInc
@@ -45,8 +48,16 @@ function Build-And-Run([string]$name, [string[]]$sources, [string[]]$includes = 
     if ($LASTEXITCODE -ne 0) { throw "编译失败: $name (exit $LASTEXITCODE)" }
 
     Write-Host "运行: $exe`n" -ForegroundColor DarkGray
-    & $exe
+    $out = & $exe 2>&1
+    $out | ForEach-Object { Write-Host $_ }
     if ($LASTEXITCODE -ne 0) { throw "$name 存在失败项 (exit $LASTEXITCODE)" }
+    # 收集各项总数，供文件末尾的「文档数字一致性门禁」使用
+    $text = ($out | Out-String)
+    $m = [regex]::Match($text, '检查项:\s*(\d+)')
+    if (-not $m.Success) { $m = [regex]::Match($text, '(\d+)\s*项检查') }
+    if ($m.Success) { $script:testTotals[$name] = [int]$m.Groups[1].Value }
+    $m2 = [regex]::Match($text, '(\d+)\s+checks')
+    if ($m2.Success) { $script:testTotals[$name + '-checks'] = [int]$m2.Groups[1].Value }
 }
 
 # ---------------------------------------------------------------------------
@@ -162,6 +173,31 @@ foreach ($t in $syntaxTargets) {
     if ($LASTEXITCODE -ne 0) {
         throw "语法检查失败: $($t.File) ($label)"
     }
+}
+
+# ---------------------------------------------------------------------------
+# ⑧ 文档数字一致性门禁（第三方评审 N1/N2/D1 的根治办法）
+#    事实来源：pio 指令数取 src/vfd_scan.pio.h 的 wrap+1；测试项数取上面各程序的实测总数。
+#    比对范围：README / docs/00·08·15 / 源码注释 / 工作流里的对应数字；不一致即失败。
+#    没有 node 时只警告不拦（CI 的 ubuntu runner 自带 node，门禁在 CI 上强制执行）。
+# ---------------------------------------------------------------------------
+$node = Get-Command node -ErrorAction SilentlyContinue
+if ($node) {
+    $parts = @()
+    foreach ($k in @('vfd_host_tests','ssd1306_host_tests','pio_seed_timing','ssd1306_pio_host_tests','master_phases_host_tests')) {
+        if ($script:testTotals.ContainsKey($k)) { $parts += $script:testTotals[$k] }
+    }
+    $hostTotal = ($parts | Measure-Object -Sum).Sum
+    $handshake = 0
+    if ($script:testTotals.ContainsKey('dualcore_handoff-checks')) { $handshake = $script:testTotals['dualcore_handoff-checks'] }
+    $gateArgs = @((Join-Path $PSScriptRoot 'tools/check_doc_numbers.js'))
+    if ($parts.Count -eq 5) { $gateArgs += @('--host-parts', ($parts -join ','), '--host-total', "$hostTotal") }
+    if ($handshake -gt 0) { $gateArgs += @('--handshake-total', "$handshake") }
+    Write-Host "`n文档数字一致性门禁:" -ForegroundColor Cyan
+    & node @gateArgs
+    if ($LASTEXITCODE -ne 0) { throw "文档数字一致性门禁失败：文档里的数字与代码事实不一致（见上）" }
+} else {
+    Write-Host "`n（未找到 node，跳过文档数字一致性门禁）" -ForegroundColor Yellow
 }
 
 Write-Host "`n全部宿主机测试与语法检查通过" -ForegroundColor Green

@@ -16,7 +16,7 @@
  * │     · 阳极数据由 DMA 连续灌入 TX FIFO（DREQ 节流，PIO 自己数 48 字节/扫描）
  * │     · 扫描周期由 BK(PWM) 的消隐边沿同步 —— 数据传输天然落在消隐窗口内
  * │     · 帧末的栅极链播种(1,1,0,0,0) 由 CPU 在帧完成中断里直接翻引脚（seedGrid()，2026-10-08 `da9b6a1` 起；
- * │       原先在 PIO 程序里（旧版 32 条满额，搬走后程序 25/32）—— 见 docs/08 §7 的 P6）
+ * │       原先在 PIO 程序里（旧版 32 条满额，搬走后程序 26/32）—— 见 docs/08 §7 的 P6）
  * │   CPU 只在一帧结束时进一次中断（123 Hz）：换帧缓冲 + 重启 DMA
  * │   ⇒ 扫描时序不再依赖中断延迟；即使主循环/中断被拖慢，扫描仍按时序进行
  * └
@@ -244,7 +244,10 @@ public:
     uint32_t clockHz() const;       /* 阳极移位时钟实际频率 */
     uint32_t litWindowUs() const { return _litWindowUs; }
     uint32_t litWindowMaxUs() const { return _maxLitUs; }
-    uint32_t guardMarginUs() const;  /* 消隐保护相对工作量的余量（us） */
+    /* 落点判据下的**剩余窗口**（us）：低亮度 = 消隐 − 边界 − 搬运；高亮度 = 点亮 − 搬运。
+     * ⚠️ 这是"还剩多少空间给播种/收尾"的诊断数字，**不是** fits 检查 —— 真正的自洽性由
+     * vfd_pio_seed_timing.h 的 static_assert 在编译期互锁（v1.5.1 按评审意见订正措辞）。 */
+    uint32_t guardMarginUs() const;
     bool engineStalled() const;      /* 引擎当前是否卡住 */
     bool engineError() const { return _engineError; }
     uint32_t dmaBusyErrors() const { return _dmaBusyErrors; }

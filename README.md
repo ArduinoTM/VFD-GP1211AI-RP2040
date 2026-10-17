@@ -53,7 +53,7 @@ STM32F103 Arduino 驱动）**移植到 RP2040 / Raspberry Pi Pico（Pico SDK）*
 | 带内 3 列槽序 | **原驱动约定**：`t 偶 → off 0,2,4`、`t 奇 → off 5,3,1` | `packScan()` |
 | 扫描相位 | **−1**（边界锁存的是上一扫描移入的数据 ⇒ 数据侧提前一个扫描发） | `wirePrepareFrame()` |
 | T43 | 手册 Note 12：该时序**只能用 a,b** ⇒ `off 2 / off 4`、`k` 整体 −2、只写两个槽（c,d,e,f 全 OFF） | `packScan()` 的 `t43` 分支 |
-| 数据段 | 逐 bit 消费（`set y,2` + `set x,15` + `jmp x--` + `jmp y--`，程序 25/32）；**不要**再用"每扫描一个控制字 + `out x,32` 按字读 OSR"（OSR 初始 32 bit 会让流错位） | `src/vfd_scan.pio` |
+| 数据段 | 逐 bit 消费（`set y,2` + `set x,15` + `jmp x--` + `jmp y--`，程序 26/32）；**不要**再用"每扫描一个控制字 + `out x,32` 按字读 OSR"（OSR 初始 32 bit 会让流错位） | `src/vfd_scan.pio` |
 | 两条 `wait` | 不可省（一次扫描只有 ≈88 µs，结束时 BK 仍为消隐高电平） | 同上 |
 
 ## 目录
@@ -103,7 +103,7 @@ powershell -File tests\run_host_tests.ps1      # 需要 g++/clang++（6 个程�
 **Adafruit_SSD1306 等主机库的真实滚动字节流回放**）；
 另有 `pio_seed_timing`（46 项：PIO 程序结构 + 边界四步 + 扫描相位模型 + 两个引擎的落点/亮度映射模型 + 帧末播种等价性 + 实测复核断言）、
 `ssd1306_pio_host_tests`（53 项：从机 PIO 线上格式）、`master_phases_host_tests`（43 项：主控相位序列回放）
-与 `dualcore_handoff`（**79102 项**：双核核间 2 槽 SPSC 协议的全状态组合 —— 丢帧守卫、槽位轮换、最新帧选择）。
+与 `dualcore_handoff`（**79102 项**：双核核间 2 槽 SPSC 协议的定种子随机交错仿真（≈75k 次不变量求值 + 槽位映射全循环） —— 丢帧守卫、槽位轮换、最新帧选择）。
 
 **逻辑分析仪门禁**（第三方无硬件也可复跑）：`tests/tools/analyze_la_csv.js <csv> --compliance` 逐条核对手册
 电气特性与 Note 3/7①②③④/10-11/14/16，**任一条不合格或测不到都返回非 0**；`tests/tools/check_seed_window.js <csv>`
@@ -116,6 +116,15 @@ powershell -File tests\run_host_tests.ps1      # 需要 g++/clang++（6 个程�
 `-DVFD_DEBUG_DIAG=0/1`、`-DVFD_DUAL_CORE=0/1` 的组合编译多遍，共 17 个 SDK 目标 + 6 个 `.ino`）
 做 `-fsyntax-only` 语法/类型检查 —— 在没装 pico-sdk 与 arm-none-eabi-gcc 的机器上
 也能抓出语法、类型、成员名错误（它不能替代真实固件构建）。
+
+> **Windows/MinGW 用户注意**：本地跑 `tests\run_host_tests.ps1` 会看到 **1 条** `-Wattributes` 对齐告警
+> （`requested alignment 16384 is larger than 8192`）—— 这是 PE/COFF 目标格式的 8 KB 对齐上限，**不是缺陷**
+> （`alignas(16384)` 是刻意的：环形 DMA 缓冲要按大小对齐；arm-none-eabi / Linux 的 ELF 目标没有这条限制，
+> 所以 CI 上的"0 警"成立）。
+
+> **文档数字一致性门禁**：`run_host_tests.ps1` 跑完会自动执行 `tests/tools/check_doc_numbers.js`，
+> 把 pio 指令数（取自 `vfd_scan.pio.h`）、宿主测试项数（取自实测输出）、黄金样本清单与本仓库文档比对，
+> 不一致即失败 —— 防止 README / 报告 / CI 工作流里的数字与代码脱钩。
 
 ### 2) RP2040 固件
 
@@ -224,7 +233,7 @@ PIO 引擎额外要求 `LAT/CLKg/SIg` 三者**引脚连续**（默认 GP4/5/6）
 | 诊断输出 | `-DVFD_DEBUG_DIAG=off`（默认）。`on` = 逐秒打印 SSD1306 状态 / CPU 占用 / 帧抖动 / pinmon / slave-dbg / pc_hist / waits / `gapmax`(排水间隔) / `SCAN`(RX DMA)，**默认只走 UART**（`-DVFD_DEBUG_DIAG_USB=on` 才同时走 USB）；`off` 只留启动横幅与告警 | 同左（两引擎共用同一份 `main.cpp`）|
 | Flash / RAM | 诊断 off `text 69012 B` / `bss 33596 B`；诊断 on `text 77820 B` / `bss 33648 B` | 诊断 off `text 68892 B` / `bss 35628 B`；诊断 on `text 77572 B` / `bss 35680 B` |
 | 中断放置 | `scanTimerThunk`（含内联的 `scanTick`）位于 **RAM 0x200000d4，292 B** | `dmaIrqThunk`（含内联的 `onFrameDmaDone`/排程）位于 **RAM 0x20000150，276 B** |
-| PIO 程序 | 从机 **15/32** 条指令（`ssd1306_spi_slave.pio`，含滚动） | 扫描 **25/32**（`vfd_scan.pio`）+ 从机 15/32，运行时均经 `pio_can_add_program()` 校验 |
+| PIO 程序 | 从机 **15/32** 条指令（`ssd1306_spi_slave.pio`，含滚动） | 扫描 **26/32**（`vfd_scan.pio`）+ 从机 15/32，运行时均经 `pio_can_add_program()` 校验 |
 | 产物 | `build-rp2040/…uf2`（诊断关 **135 KB** / 诊断开 152 KB） | `build-rp2040-pio/…uf2`（诊断关 **135 KB** / 诊断开 152 KB） |
 | 双核（`-DVFD_DUAL_CORE=ON`，诊断开） | `build-rp2040-diagon-dual/…uf2` **145.5 KB**（`text 74404 B` / `bss 36720 B`） | `build-rp2040-pio-diagon-dual/…uf2` **145 KB**（`text 74004 B` / `bss 38752 B`） |
 

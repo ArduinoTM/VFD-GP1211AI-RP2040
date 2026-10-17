@@ -24,7 +24,7 @@ jobs:
       - name: 安装 g++
         run: sudo apt-get update && sudo apt-get install -y g++
 
-      - name: 运行宿主测试（325 项 + 核间握手 79102 项 + SDK 语法桩 + 6 个 .ino 语法）
+      - name: 运行宿主测试 + 文档数字一致性门禁（项数以测试自报为准）
         shell: pwsh
         run: ./tests/run_host_tests.ps1
 

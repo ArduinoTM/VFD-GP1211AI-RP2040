@@ -179,6 +179,12 @@ void Rp2040Platform::engineStop()
     _seedPending = false;
     dma_channel_abort(static_cast<uint>(_cfg.dma_tx));
     dma_channel_abort(static_cast<uint>(_cfg.dma_rx));
+    /* P2-6（v1.5.1）：停扫后把栅极输入钉回手册规定的空闲电平 —— CLKg 空闲**高**（与 Note 7① 同理）、
+     * LAT 空闲低、SIg 空闲低。CLKa 是 SPI 的 SCK（MODE3 ⇒ CPOL=1，空闲电平就是高），停扫后本来就
+     * 停在高电平，不需要（也不能）用 SIO 去写它。 */
+    gpio_put(_cfg.pin_clkg, 1);
+    gpio_put(_cfg.pin_lat, 0);
+    gpio_put(_cfg.pin_sig, 0);
 }
 
 void Rp2040Platform::engineDeinit()

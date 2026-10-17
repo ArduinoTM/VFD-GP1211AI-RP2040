@@ -269,6 +269,14 @@ void Rp2040Platform::engineStop()
 {
     pio_sm_set_enabled(_cfg.pio, _cfg.sm, false);
     dma_channel_abort(static_cast<uint>(_cfg.dma_ch));
+    /* P2-6（v1.5.1）：SM 停掉后引脚会保持最后一拍的电平。这里把四个显示输入切回 SIO，并钉在
+     * 手册规定的空闲电平：CLKa/CLKg 空闲**高**（Note 7①）、LAT/SIg 空闲低。
+     * 下一次 engineInit() 会重新 pio_gpio_init / 设置方向，所以切回 SIO 是安全的。 */
+    const uint8_t pins[4] = {_cfg.pin_clka, _cfg.pin_clkg, _cfg.pin_lat, _cfg.pin_sig};
+    for (int i = 0; i < 4; ++i) {
+        gpio_set_function(pins[i], GPIO_FUNC_SIO);
+        gpio_put(pins[i], (i <= 1) ? 1 : 0);
+    }
 }
 
 void Rp2040Platform::engineDeinit()
